@@ -75,7 +75,7 @@ variant without losing the underlying `io::Error` chain:
 
 Today, every kanon crate that spawns a subprocess: `pragma`, `archeion`,
 `basanos`, `angelos`, `kanon`, `mnemosyne`, `stoa`. Future fleet consumers
-take a hard dependency on this crate rather than reinventing the wrapper.
+take a hard dependency on this crate instead of reinventing the wrapper.
 
 ## License
 

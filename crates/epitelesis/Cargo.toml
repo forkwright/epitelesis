@@ -39,8 +39,9 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 # WHY: kanon's MANIFEST/missing-maturity-metadata expects every workspace
-# member to declare maturity + since-date so the standards engine can read
-# crate readiness without parsing rustdoc.
+# member to declare maturity, since-date, and exit-criteria so the standards
+# engine can read crate readiness without parsing rustdoc.
 [package.metadata.kanon]
 maturity = "alpha"
 since = "2026-05-28"
+exit-criteria = "kanon and ≥1 other fleet repo consume v0.1.x at a pinned tag; release-please cuts v0.2.0 marking surface freeze"

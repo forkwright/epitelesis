@@ -53,6 +53,6 @@ subprocess invocation passes through; consumers compose on top.
 
 ## Why one crate, one workspace
 
-The workspace shape (rather than a single-crate-at-root) leaves room for
-adjacent helpers (an `epitelesis-cli` smoke binary, a test-helper crate for
-fixtures) without restructuring. Today there is one crate.
+A workspace at root (instead of a bare single-crate layout) leaves room for
+sibling helpers (an `epitelesis-cli` smoke binary, a test-helper crate for
+fixtures) without restructuring. Today the workspace has one member.

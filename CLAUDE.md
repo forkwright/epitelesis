@@ -1,7 +1,7 @@
 <!--
 scope: epitelesis repo conventions (command-execution substrate)
-defers_to: ~/.claude/CLAUDE.md for operator principles; ~/dev/kanon/crates/basanos/standards/ for fleet engineering policy
-tightens: crates/epitelesis/CLAUDE.md (if added) can narrow conventions within the crate
+defers_to: AGENTS.md for dispatch conventions; ARCHITECTURE.md for the public surface
+tightens: none today; future per-crate CLAUDE.md files can narrow conventions within their blast radius
 -->
 
 # CLAUDE.md

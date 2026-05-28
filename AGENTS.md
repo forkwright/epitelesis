@@ -1,10 +1,10 @@
-# AGENTS.md
-
 <!--
 scope: epitelesis repo  -  agent onboarding and dispatch conventions
 defers_to: CLAUDE.md for full coding conventions; README.md for the public surface
-tightens: per-crate AGENTS.md files (none today) can narrow conventions within the crate
+tightens: per-crate AGENTS.md files (when added) can narrow conventions within the crate
 -->
+
+# AGENTS.md
 
 ## Purpose
 
