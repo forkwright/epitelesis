@@ -1,0 +1,12 @@
+# Canonical license fingerprint metadata for MANIFEST/license-spdx-match.
+#
+# epitelesis is dual-licensed Apache-2.0 OR MIT. The kanon basanos
+# CANONICAL_HASHES table does not include this dual-license combo,
+# so this fingerprint file declares the SHA256 of epitelesis's
+# repo-root LICENSE file directly.
+#
+# Workflow: if LICENSE is updated, recompute via `sha256sum LICENSE`
+# and update the hash below.
+
+[sha256]
+LICENSE = "919f28703d2e715e1d808e7bfda069fd7396ab6d01f199516fbc5582c3dd5a48"

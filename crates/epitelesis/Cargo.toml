@@ -1,0 +1,46 @@
+[package]
+name = "epitelesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Project-wide command-execution wrapper substrate for the forkwright fleet"
+readme = "../../README.md"
+
+[features]
+default = []
+# WHY: gates `epitelesis::spawn` (tokio::process::Command) so consumers that
+# only need the sync `run` path don't pull tokio.
+async = ["dep:tokio"]
+
+[dependencies]
+snafu = { workspace = true }
+tracing = { workspace = true }
+# WHY: tokio is gated behind the `async` feature so default builds stay
+# sync-only and don't pay the runtime cost or dep weight when unused.
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+# WHY: tempfile-backed scratch directories let cwd/env tests exercise real
+# filesystem state without polluting the worktree.
+tempfile = "3"
+# WHY: timeout + non-zero-exit fixtures spawn `sh -c '...'`-style commands; the
+# async test path needs a runtime to drive `epitelesis::spawn`.
+tokio = { workspace = true }
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# WHY: kanon's MANIFEST/missing-maturity-metadata expects every workspace
+# member to declare maturity + since-date so the standards engine can read
+# crate readiness without parsing rustdoc.
+[package.metadata.kanon]
+maturity = "alpha"
+since = "2026-05-28"

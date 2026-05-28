@@ -1,0 +1,6 @@
+[toolchain]
+# WHY: pin to the same stable channel the kanon workspace uses (rust-version
+# 1.94 in Cargo.toml). epitelesis is sync-by-default + tokio-gated; no nightly
+# features are exercised by the crate or its tests.
+channel = "1.94"
+components = ["rustfmt", "clippy"]

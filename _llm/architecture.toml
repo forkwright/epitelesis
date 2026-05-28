@@ -1,0 +1,27 @@
+[meta]
+name = "epitelesis"
+repo = "forkwright/epitelesis"
+generated = false
+source_docs = [
+  "README.md",
+  "ARCHITECTURE.md",
+  "Cargo.toml",
+]
+
+[architecture]
+summary = "Fleet command-execution wrapper substrate: builder, sync runners, optional async runner, typed errors, tracing spans."
+layers = [
+  "builder",
+  "runner",
+  "error",
+]
+
+[[architecture.crates]]
+name = "epitelesis"
+path = "crates/epitelesis"
+role = "Single crate: Command builder + sync (run/output/status/spawn_child) + optional async (spawn, feature = 'async') + typed Error/Output."
+
+[[interfaces]]
+name = "epitelesis"
+kind = "rust-library"
+path = "crates/epitelesis"

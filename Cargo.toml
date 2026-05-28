@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/epitelesis",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0 OR MIT"
+homepage = "https://github.com/forkwright/epitelesis"
+repository = "https://github.com/forkwright/epitelesis"
+authors = ["forkwright"]
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# WHY: warn not deny for unwrap/expect — tests legitimately use these.
+# Library code enforces deny via per-crate attributes.
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+await_holding_lock = "deny"
+# WHY: pedantic overrides — line numbers and durations are u32/u64 by design.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+# WHY: adding # Errors / # Panics to every fallible function is boilerplate.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# WHY: backtick enforcement in doc comments is noisy for prose-heavy docs.
+doc_markdown = "allow"
+# WHY: module_name_repetitions is noisy for re-exports.
+module_name_repetitions = "allow"
+# WHY: must_use on every pure function is excessive for internal APIs.
+must_use_candidate = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+snafu = "0.8"
+tracing = "0.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

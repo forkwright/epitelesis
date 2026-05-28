@@ -1,0 +1,27 @@
+[meta]
+name = "epitelesis"
+repo = "forkwright/epitelesis"
+generated = false
+source_docs = [
+  "README.md",
+  "CHANGELOG.md",
+]
+
+[state]
+summary = "Initial extraction from forkwright/kanon (D-067 Tier B EXTRACT-NOW). Single crate, sync runners stable, async runner gated by feature."
+current_phase = "Post-extraction stabilisation; consumer cutover via kanon workspace dep rewire (forkwright/kanon PR)."
+updated = "2026-05-28"
+
+[[recent]]
+date = "2026-05-28"
+item = "Extracted from kanon (crates/epitelesis -> forkwright/epitelesis). Initial scaffold + standards + workflows landed."
+
+[[open_threads]]
+name = "kanon consumer cutover"
+issue = 0
+status = "Coordinated forkwright/kanon PR drops crates/epitelesis from the workspace and rewires the workspace dep as git = forkwright/epitelesis. Merges after this repo's #1."
+
+[[open_threads]]
+name = "v0.1.0 release tag"
+issue = 0
+status = "release-please opens the first release PR after #1 lands; tag v0.1.0 becomes the pin target for kanon."
