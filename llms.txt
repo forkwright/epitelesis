@@ -1,0 +1,23 @@
+# epitelesis
+
+> ἐπιτέλεσις — the process of executing-to-completion. Fleet-wide command-execution wrapper substrate.
+
+## Library
+
+The public surface is the single Rust crate under `crates/epitelesis/`. See
+the crate-root rustdoc and [README.md](README.md) for the API summary.
+
+## Architecture
+
+Structured LLM corpus:
+- [_llm/architecture.toml](_llm/architecture.toml): crate role and module layout
+- [_llm/current_state.toml](_llm/current_state.toml): current phase and consumers
+- [_llm/decisions.toml](_llm/decisions.toml): accepted decisions
+
+## Agent entry points
+
+- [README.md](README.md): public surface and quickstart
+- [CLAUDE.md](CLAUDE.md): agent conventions
+- [AGENTS.md](AGENTS.md): dispatch conventions
+- [ARCHITECTURE.md](ARCHITECTURE.md): module roles + SemVer contract
+- [SECURITY.md](SECURITY.md): vulnerability reporting policy

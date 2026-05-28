@@ -1,0 +1,34 @@
+# archetype:
+# forge-only: true
+# spdx: Apache-2.0 OR MIT
+
+# Forge CI pipeline for forkwright/epitelesis.
+#
+# Mirrors the hardcoded default Rust gate (fmt -> check -> clippy -> nextest
+# -> lint). The crate's dep tree is small (snafu + tracing, optional tokio),
+# so the default timeouts are plenty. Concurrency caps (--jobs, --build-jobs,
+# --test-threads) are required by CI/kanon-ci-concurrency-caps to keep
+# parallelism bounded on shared self-hosted runners.
+
+[pipeline]
+stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest", "kanon lint"]
+
+[stages."cargo fmt"]
+cmd = "cargo fmt --all -- --check"
+timeout_secs = 300
+
+[stages."cargo check"]
+cmd = "cargo check --workspace --all-targets --all-features --jobs 8"
+timeout_secs = 600
+
+[stages."cargo clippy"]
+cmd = "cargo clippy --workspace --all-targets --all-features --jobs 8 -- -D warnings"
+timeout_secs = 600
+
+[stages."cargo nextest"]
+cmd = "cargo nextest run --workspace --all-features --build-jobs 8 --test-threads 8"
+timeout_secs = 900
+
+[stages."kanon lint"]
+cmd = "kanon lint . --summary"
+timeout_secs = 300

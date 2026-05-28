@@ -1,0 +1,43 @@
+[meta]
+name = "epitelesis"
+repo = "forkwright/epitelesis"
+generated = false
+source_docs = [
+  "README.md",
+  "ARCHITECTURE.md",
+]
+
+[decisions]
+summary = "Core decisions for the fleet command-execution substrate."
+
+[[decision]]
+id = "D-extract-from-kanon"
+title = "Extract epitelesis from kanon to its own fleet repo"
+status = "accepted"
+context = "kanon planning D-067 (Tier B EXTRACT-NOW): the crate is fleet substrate by self-description ('project-wide command-execution wrapper substrate for the forkwright fleet'). Multiple kanon crates already depend on it; future cross-fleet consumers would too."
+decision = "Ship epitelesis from forkwright/epitelesis as a workspace with one crate at crates/epitelesis/. Consumers pin a git tag at the workspace level."
+consequences = "kanon consumes epitelesis as a workspace git dep. The basanos RUST/no-direct-process-command rule loses its in-tree path exemption for crates/epitelesis/ — the crate is external; the lint exemption goes away as dead code."
+
+[[decision]]
+id = "D-workspace-shape"
+title = "Workspace with one crate, room for siblings"
+status = "accepted"
+context = "epitelesis today is a single crate, but plausible future helpers (epitelesis-cli for ad-hoc subprocess smoke tests, an epitelesis-test-helpers crate for fixtures) want to live in the same repo."
+decision = "Use a workspace at the repo root with the production crate at crates/epitelesis/. Release-please uses release-type 'simple' with extra-files bumping the workspace version."
+consequences = "Adding a sibling crate later is a Cargo.toml members edit, not a repo restructure."
+
+[[decision]]
+id = "D-dual-license"
+title = "Dual-license Apache-2.0 OR MIT"
+status = "accepted"
+context = "epitelesis is fleet substrate intended for cross-fleet consumption. theatron (the worked-example fleet repo) uses Apache-2.0 OR MIT for the same reason: ecosystem norm + permissive consumer reuse."
+decision = "Apache-2.0 OR MIT, with LICENSE-APACHE / LICENSE-MIT / LICENSE at repo root following theatron."
+consequences = "Consumers inside and outside the forkwright fleet take a single dep without contagious licensing."
+
+[[decision]]
+id = "D-async-as-feature"
+title = "Async runner is an additive Cargo feature"
+status = "accepted"
+context = "Inherited from kanon's crate. Most consumers only need the sync run path; pulling tokio in by default would tax sync-only consumers with a heavyweight dep."
+decision = "Keep `epitelesis::spawn` gated by `feature = 'async'`. Default builds stay sync-only and do not depend on tokio."
+consequences = "Async consumers opt in via feature flag and pay for what they use. Sync consumers stay lean."
