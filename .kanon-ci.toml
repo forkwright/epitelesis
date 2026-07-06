@@ -8,7 +8,7 @@
 # -> lint). The crate's dep tree is small (snafu + tracing, optional tokio),
 # so the default timeouts are plenty. Concurrency caps (--jobs, --build-jobs,
 # --test-threads) are required by CI/kanon-ci-concurrency-caps to keep
-# parallelism bounded on shared self-hosted runners.
+# parallelism bounded on GitHub-hosted runners.
 
 [pipeline]
 stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest", "kanon lint"]

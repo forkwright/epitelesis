@@ -73,9 +73,11 @@ variant without losing the underlying `io::Error` chain:
 
 ## Consumers
 
-Today, every kanon crate that spawns a subprocess: `pragma`, `archeion`,
-`basanos`, `angelos`, `kanon`, `mnemosyne`, `stoa`. Future fleet consumers
-take a hard dependency on this crate instead of reinventing the wrapper.
+Today, every crate of [forkwright/kanon](https://github.com/forkwright/kanon)
+(the fleet's standards and dispatch toolkit) that spawns a subprocess:
+`pragma`, `archeion`, `basanos`, `angelos`, `kanon`, `mnemosyne`, `stoa`.
+Future fleet consumers take a hard dependency on this crate instead of
+reinventing the wrapper.
 
 ## License
 
