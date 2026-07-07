@@ -5,11 +5,24 @@
 //! every field already validated by the type system. The runners stay free of
 //! ergonomic concerns and focus on execution semantics.
 
-use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+
+/// One environment mutation, replayed onto the child in builder-call order.
+///
+/// WHY: storing mutations as an ordered log instead of a map+list pair makes
+/// the child environment a pure function of builder-call order, matching
+/// `std::process::Command` semantics where the later of `env` / `env_remove`
+/// wins for the same key.
+#[derive(Debug)]
+pub(crate) enum EnvOp {
+    /// Set `key` to `value` in the child environment.
+    Set(OsString, OsString),
+    /// Remove `key` from the environment the child inherits.
+    Remove(OsString),
+}
 
 /// Builder describing a subprocess invocation.
 ///
@@ -20,8 +33,7 @@ use std::time::Duration;
 pub struct Command {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<OsString>,
-    pub(crate) env: HashMap<OsString, OsString>,
-    pub(crate) env_remove: Vec<OsString>,
+    pub(crate) env_ops: Vec<EnvOp>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) stdin: Option<Stdio>,
     pub(crate) stdout: Option<Stdio>,
@@ -40,8 +52,7 @@ impl Command {
         Self {
             program: program.into(),
             args: Vec::new(),
-            env: HashMap::new(),
-            env_remove: Vec::new(),
+            env_ops: Vec::new(),
             cwd: None,
             stdin: None,
             stdout: None,
@@ -75,19 +86,27 @@ impl Command {
     /// inherit the parent's full environment when running untrusted helpers.
     /// `epitelesis` mirrors the standard library's behaviour: variables set
     /// here are *added* to the parent environment; the child inherits the
-    /// rest. Callers wanting strict isolation should construct fresh
-    /// `Command`s and use the runner's process namespace conventions.
+    /// rest, and the later of [`Command::env`] / [`Command::env_remove`] wins
+    /// for the same key. Callers wanting strict isolation should construct
+    /// fresh `Command`s and use the runner's process namespace conventions.
     #[must_use]
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        self.env
-            .insert(key.as_ref().to_os_string(), value.as_ref().to_os_string());
+        self.env_ops.push(EnvOp::Set(
+            key.as_ref().to_os_string(),
+            value.as_ref().to_os_string(),
+        ));
         self
     }
 
     /// Remove one inherited environment variable from the child process.
+    ///
+    /// Mirrors `std::process::Command::env_remove` call-order semantics: a
+    /// removal after [`Command::env`] for the same key removes the variable;
+    /// an [`Command::env`] call after the removal re-sets it.
     #[must_use]
     pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
-        self.env_remove.push(key.as_ref().to_os_string());
+        self.env_ops
+            .push(EnvOp::Remove(key.as_ref().to_os_string()));
         self
     }
 
@@ -100,8 +119,10 @@ impl Command {
         V: AsRef<OsStr>,
     {
         for (key, value) in vars {
-            self.env
-                .insert(key.as_ref().to_os_string(), value.as_ref().to_os_string());
+            self.env_ops.push(EnvOp::Set(
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            ));
         }
         self
     }
@@ -149,6 +170,11 @@ impl Command {
     /// hangs into observable [`crate::Error::Timeout`] errors keeps the queue
     /// liveness model honest. Callers that genuinely need an unbounded
     /// invocation simply omit this method.
+    ///
+    /// The timeout is enforced by [`crate::run`] / [`crate::output`] /
+    /// [`crate::status`] and by [`crate::spawn`]. [`crate::spawn_child`]
+    /// cannot enforce it (the caller owns the raw child handle) — see its
+    /// documentation for how that mismatch surfaces.
     #[must_use]
     pub fn timeout(mut self, dur: Duration) -> Self {
         self.timeout = Some(dur);
@@ -158,25 +184,33 @@ impl Command {
     /// Run this invocation and return captured output for both zero and
     /// non-zero exits.
     ///
-    /// Convenience forwarding method for [`crate::output`].
+    /// Convenience forwarding method for [`crate::output`]. The `io::Error`
+    /// preserves the underlying [`std::io::ErrorKind`] where one exists
+    /// (spawn/wait failures) and maps timeouts to
+    /// [`std::io::ErrorKind::TimedOut`].
     pub fn output(self) -> std::io::Result<std::process::Output> {
         crate::output(self)
             .map(into_std_output)
-            .map_err(std::io::Error::other)
+            .map_err(into_io_error)
     }
 
     /// Run this invocation and return its exit status for both zero and
     /// non-zero exits.
     ///
-    /// Convenience forwarding method for [`crate::status`].
+    /// Convenience forwarding method for [`crate::status`]. The `io::Error`
+    /// preserves the underlying [`std::io::ErrorKind`] where one exists
+    /// (spawn/wait failures) and maps timeouts to
+    /// [`std::io::ErrorKind::TimedOut`].
     pub fn status(self) -> std::io::Result<std::process::ExitStatus> {
-        crate::status(self).map_err(std::io::Error::other)
+        crate::status(self).map_err(into_io_error)
     }
 
     /// Spawn this invocation and return the child handle.
     ///
     /// This preserves the child-handle shape needed by streaming callers while
-    /// keeping the raw process creation inside the epitelesis substrate.
+    /// keeping the raw process creation inside the epitelesis substrate. A
+    /// configured [`Command::timeout`] cannot be enforced on a raw handle —
+    /// see [`crate::spawn_child`] for how that mismatch surfaces.
     pub fn spawn(self) -> std::io::Result<std::process::Child> {
         crate::spawn_child(self)
     }
@@ -201,15 +235,26 @@ impl Command {
         self.args.iter().map(OsString::as_os_str)
     }
 
-    /// Iterate over configured environment overrides and removals.
+    /// Iterate over the *effective* environment configuration.
     ///
-    /// Compatibility helper for migrated call sites that previously inspected
-    /// `std::process::Command` in tests.
+    /// Mirrors `std::process::Command::get_envs`: entries are sorted by key,
+    /// each key appears exactly once, and the value is `Some` for a variable
+    /// that will be set or `None` for one that will be removed. When a key was
+    /// passed to both [`Command::env`] and [`Command::env_remove`], the later
+    /// builder call wins — the same resolution the runners apply.
     pub fn get_envs(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
-        self.env
-            .iter()
-            .map(|(key, value)| (key.as_os_str(), Some(value.as_os_str())))
-            .chain(self.env_remove.iter().map(|key| (key.as_os_str(), None)))
+        let mut effective = std::collections::BTreeMap::new();
+        for op in &self.env_ops {
+            match op {
+                EnvOp::Set(key, value) => {
+                    effective.insert(key.as_os_str(), Some(value.as_os_str()));
+                }
+                EnvOp::Remove(key) => {
+                    effective.insert(key.as_os_str(), None);
+                }
+            }
+        }
+        effective.into_iter()
     }
 
     /// Borrow the configured timeout, if any.
@@ -224,8 +269,7 @@ impl std::fmt::Debug for Command {
         f.debug_struct("Command")
             .field("program", &self.program)
             .field("args", &self.args)
-            .field("env", &self.env)
-            .field("env_remove", &self.env_remove)
+            .field("env_ops", &self.env_ops)
             .field("cwd", &self.cwd)
             .field("stdin", &self.stdin.as_ref().map(|_| "configured"))
             .field("stdout", &self.stdout.as_ref().map(|_| "configured"))
@@ -241,4 +285,22 @@ fn into_std_output(output: crate::Output) -> std::process::Output {
         stdout: output.stdout,
         stderr: output.stderr,
     }
+}
+
+/// Convert a typed [`crate::Error`] into an `io::Error` that keeps the typed
+/// error as its source while preserving a meaningful [`std::io::ErrorKind`].
+///
+/// WHY: `Command::output` / `Command::status` mirror the `std::process`
+/// signatures for migrated call sites; those call sites match on
+/// `io::Error::kind()` (e.g. `NotFound` for a missing binary). Collapsing
+/// every failure to `ErrorKind::Other` would silently break that matching.
+fn into_io_error(error: crate::Error) -> std::io::Error {
+    let kind = match &error {
+        crate::Error::SpawnFailed { source, .. } | crate::Error::Io { source, .. } => source.kind(),
+        crate::Error::Timeout { .. } => std::io::ErrorKind::TimedOut,
+        // NOTE: NonZeroExit never reaches here (output/status return it as
+        // Ok); the arm also absorbs future #[non_exhaustive] variants.
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, error)
 }

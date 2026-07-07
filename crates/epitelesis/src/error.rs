@@ -47,14 +47,22 @@ pub enum Error {
     },
 
     /// The configured [`crate::Command::timeout`] elapsed before the child
-    /// exited. The runner has already attempted to kill the child by the time
-    /// this error is returned.
+    /// exited. The runner has already killed and reaped the child by the
+    /// time this error is returned.
     #[snafu(display("{program} timed out after {duration:?}"))]
     Timeout {
         /// Display form of the program.
         program: String,
         /// The timeout that elapsed.
         duration: Duration,
+        /// Bytes the child wrote to stdout before the timeout fired.
+        ///
+        /// WHY: partial output is diagnostic evidence — a killed child's
+        /// last words often say exactly where it stalled. Empty when the
+        /// caller redirected stdout away from a pipe or the drain failed.
+        stdout: Vec<u8>,
+        /// Bytes the child wrote to stderr before the timeout fired.
+        stderr: Vec<u8>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,

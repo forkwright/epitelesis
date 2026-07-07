@@ -30,8 +30,8 @@ file each instead of being reinvented per call site.
 | `command` | Builder type capturing program, args, env, cwd, timeout, stdio. Not `Clone` by design — each invocation owns its configuration. |
 | `output` | Captured `Output` (status + stdout + stderr + elapsed duration). Returned by `run` on success and carried inside `Error::NonZeroExit` on failure. |
 | `error` | Typed `Error` enum (snafu, `#[non_exhaustive]`) with `SpawnFailed`, `NonZeroExit`, `Timeout`, `Io` variants. |
-| `sync` | Sync runners (`run`, `output`, `status`, `spawn_child`) over `std::process::Command`. Concurrent pipe drain via dedicated reader threads so children writing more than the OS pipe buffer (~64 KiB) do not deadlock against `wait()`. |
-| `async_impl` | Async `spawn` over `tokio::process::Command` (feature = `async`). Mirrors the sync semantics: success returns `Output`, non-zero exit returns `Error::NonZeroExit` with the payload, exceeded timeout returns `Error::Timeout`. |
+| `sync` | Sync runners (`run`, `output`, `status`, `spawn_child`) over `std::process::Command`. Concurrent pipe drain via dedicated reader threads so children writing more than the OS pipe buffer (~64 KiB) do not deadlock against `wait()`. Every failure path (timeout or wait IO error) reaps the child and joins the drain threads before returning. |
+| `async_impl` | Async `spawn` over `tokio::process::Command` (feature = `async`). Mirrors the sync semantics by construction — the child is assembled from the same builder-to-process translation the sync path uses, so stdio defaults/overrides and env call-order resolution cannot drift: success returns `Output`, non-zero exit returns `Error::NonZeroExit` with the payload, exceeded timeout kills the child and returns `Error::Timeout` with the partial output. |
 
 ## Public surface
 
