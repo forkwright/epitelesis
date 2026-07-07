@@ -68,7 +68,8 @@ variant without losing the underlying `io::Error` chain:
   Carries the captured `Output` payload so callers retain access to
   `stdout`/`stderr`/`status` even on failure.
 - `Error::Timeout`  -  configured `Command::timeout` elapsed; the runner has
-  already attempted to kill the child by the time this error returns.
+  already killed and reaped the child by the time this error returns.
+  Carries the partial `stdout`/`stderr` captured before the deadline.
 - `Error::Io`  -  IO failure while waiting on the child or capturing output.
 
 ## Consumers

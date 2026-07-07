@@ -9,9 +9,9 @@ targets = []
 all-features = false
 
 [advisories]
-
 # WHY: keep in sync with .cargo/audit.toml's [advisories.ignore] array.
 # cargo-audit does not read deny.toml, so any ignore lives in both files.
+ignore = []
 
 [licenses]
 allow = [

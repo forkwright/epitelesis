@@ -1,8 +1,24 @@
 name: Release Please
+
 on:
   push:
     branches: [main]
   workflow_dispatch: {}
+
+# WHY: release-please must never race itself on rapid main pushes; queued
+# runs are superseded, not cancelled, so an in-flight release finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# WHY: explicit grant of exactly what the shared workflow needs — release
+# PR management, tag/release creation, and source-provenance attestation.
+permissions:
+  attestations: write
+  contents: write
+  id-token: write
+  pull-requests: write
+
 jobs:
   call:
     uses: forkwright/.github/.github/workflows/release-please.yml@main

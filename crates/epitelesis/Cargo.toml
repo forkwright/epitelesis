@@ -30,6 +30,10 @@ tempfile = "3"
 # WHY: timeout + non-zero-exit fixtures spawn `sh -c '...'`-style commands; the
 # async test path needs a runtime to drive `epitelesis::spawn`.
 tokio = { workspace = true }
+# WHY: the span-attribution regression test needs a real subscriber to make
+# `Span::current()` observable, and `tracing` itself to inspect it.
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
