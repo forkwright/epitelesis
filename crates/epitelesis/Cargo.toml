@@ -23,6 +23,12 @@ tracing = { workspace = true }
 # sync-only and don't pay the runtime cost or dep weight when unused.
 tokio = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# WHY: process is the smallest safe Unix surface that supplies waitid with
+# WNOWAIT/NOHANG and process-group signaling. No libc calls or unsafe blocks
+# are needed in epitelesis, and non-Unix targets do not acquire the dependency.
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
 [dev-dependencies]
 # WHY: tempfile-backed scratch directories let cwd/env tests exercise real
 # filesystem state without polluting the worktree.

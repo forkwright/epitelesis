@@ -1,74 +1,118 @@
-//! Builder type for command invocations.
-//!
-//! WHY: A separate builder lets callers assemble the full invocation up front
-//! so [`crate::run`] / [`crate::spawn`] receive a single owned value with
-//! every field already validated by the type system. The runners stay free of
-//! ergonomic concerns and focus on execution semantics.
+//! Typestate command builder and process translation.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
 
-/// One environment mutation, replayed onto the child in builder-call order.
-///
-/// WHY: storing mutations as an ordered log instead of a map+list pair makes
-/// the child environment a pure function of builder-call order, matching
-/// `std::process::Command` semantics where the later of `env` / `env_remove`
-/// wins for the same key.
-#[derive(Debug)]
+use crate::error::{InvalidPolicySnafu, Result};
+use crate::policy::{
+    CapturePolicy, Draft, EnvironmentPolicy, ExecutionPolicy, PolicyViolation, Ready,
+    validate_deadline,
+};
+
+/// One environment mutation, replayed after the base environment policy.
 pub(crate) enum EnvOp {
-    /// Set `key` to `value` in the child environment.
     Set(OsString, OsString),
-    /// Remove `key` from the environment the child inherits.
     Remove(OsString),
 }
 
-/// Builder describing a subprocess invocation.
+impl std::fmt::Debug for EnvOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Set(key, _) => f
+                .debug_tuple("Set")
+                .field(key)
+                .field(&"<redacted>")
+                .finish(),
+            Self::Remove(key) => f.debug_tuple("Remove").field(key).finish(),
+        }
+    }
+}
+
+/// Builder describing one owned subprocess invocation.
 ///
-/// `Command` is intentionally not `Clone`. Each invocation owns its
-/// configuration; cloning would invite shared-mutable-builder patterns that
-/// undermine the parse-don't-validate boundary. Callers that need to launch
-/// the same logical command repeatedly construct a fresh [`Command`] per call.
-pub struct Command {
+/// `Command` is intentionally not `Clone`. A newly constructed
+/// `Command<Draft>` cannot be passed to a runner; declaring a bounded deadline
+/// or an intentional unbounded reason produces `Command<Ready>`.
+pub struct Command<State = Draft> {
     pub(crate) program: PathBuf,
     pub(crate) args: Vec<OsString>,
+    pub(crate) environment: EnvironmentPolicy,
     pub(crate) env_ops: Vec<EnvOp>,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) stdin: Option<Stdio>,
     pub(crate) stdout: Option<Stdio>,
     pub(crate) stderr: Option<Stdio>,
-    pub(crate) timeout: Option<Duration>,
+    pub(crate) stdout_capture: CapturePolicy,
+    pub(crate) stderr_capture: CapturePolicy,
+    pub(crate) execution: Option<ExecutionPolicy>,
+    state: PhantomData<State>,
 }
 
-impl Command {
-    /// Start building an invocation of `program`.
-    ///
-    /// `program` may be a bare executable name (resolved via `PATH`) or an
-    /// absolute path. No validation is performed at construction time —
-    /// missing programs surface at execution as [`crate::Error::SpawnFailed`].
+impl Command<Draft> {
+    /// Start a non-runnable command with a clean environment and bounded capture.
     #[must_use]
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
+            environment: EnvironmentPolicy::default(),
             env_ops: Vec::new(),
             cwd: None,
             stdin: None,
             stdout: None,
             stderr: None,
-            timeout: None,
+            stdout_capture: CapturePolicy::default(),
+            stderr_capture: CapturePolicy::default(),
+            execution: None,
+            state: PhantomData,
         }
     }
 
-    /// Append a single positional argument.
+    /// Declare a bounded wall-clock lifetime and make the command runnable.
+    pub fn deadline(mut self, duration: Duration) -> Result<Command<Ready>> {
+        validate_deadline(duration)?;
+        self.execution = Some(ExecutionPolicy::Deadline(duration));
+        Ok(self.into_state())
+    }
+
+    /// Intentionally permit an unbounded lifetime for a non-empty reason.
+    pub fn unbounded(mut self, reason: impl Into<String>) -> Result<Command<Ready>> {
+        self.execution = Some(ExecutionPolicy::Unbounded(
+            crate::policy::NonEmptyReason::new(reason)?,
+        ));
+        Ok(self.into_state())
+    }
+}
+
+impl<State> Command<State> {
+    fn into_state<Next>(self) -> Command<Next> {
+        Command {
+            program: self.program,
+            args: self.args,
+            environment: self.environment,
+            env_ops: self.env_ops,
+            cwd: self.cwd,
+            stdin: self.stdin,
+            stdout: self.stdout,
+            stderr: self.stderr,
+            stdout_capture: self.stdout_capture,
+            stderr_capture: self.stderr_capture,
+            execution: self.execution,
+            state: PhantomData,
+        }
+    }
+
+    /// Append one positional argument.
     #[must_use]
     pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
         self.args.push(arg.as_ref().to_os_string());
         self
     }
 
-    /// Append a sequence of positional arguments.
+    /// Append positional arguments.
     #[must_use]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
@@ -80,15 +124,36 @@ impl Command {
         self
     }
 
-    /// Set a single environment variable for the child process.
-    ///
-    /// WHY: explicit env passthrough is required so callers cannot accidentally
-    /// inherit the parent's full environment when running untrusted helpers.
-    /// `epitelesis` mirrors the standard library's behaviour: variables set
-    /// here are *added* to the parent environment; the child inherits the
-    /// rest, and the later of [`Command::env`] / [`Command::env_remove`] wins
-    /// for the same key. Callers wanting strict isolation should construct
-    /// fresh `Command`s and use the runner's process namespace conventions.
+    /// Replace the base environment policy.
+    #[must_use]
+    pub fn environment(mut self, policy: EnvironmentPolicy) -> Self {
+        self.environment = policy;
+        self
+    }
+
+    /// Use a clean base environment.
+    #[must_use]
+    pub fn clean_environment(self) -> Self {
+        self.environment(EnvironmentPolicy::Clean)
+    }
+
+    /// Copy only the named keys from the parent environment.
+    #[must_use]
+    pub fn allow_environment<I, K>(self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: AsRef<OsStr>,
+    {
+        self.environment(EnvironmentPolicy::allowlist(keys))
+    }
+
+    /// Inherit the full parent environment for an explicit non-empty reason.
+    pub fn inherit_environment(mut self, reason: impl Into<String>) -> Result<Self> {
+        self.environment = EnvironmentPolicy::inherit_all(reason)?;
+        Ok(self)
+    }
+
+    /// Set an environment key after applying the base policy.
     #[must_use]
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
         self.env_ops.push(EnvOp::Set(
@@ -98,11 +163,7 @@ impl Command {
         self
     }
 
-    /// Remove one inherited environment variable from the child process.
-    ///
-    /// Mirrors `std::process::Command::env_remove` call-order semantics: a
-    /// removal after [`Command::env`] for the same key removes the variable;
-    /// an [`Command::env`] call after the removal re-sets it.
+    /// Remove an environment key after applying the base policy.
     #[must_use]
     pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
         self.env_ops
@@ -110,7 +171,7 @@ impl Command {
         self
     }
 
-    /// Set multiple environment variables at once.
+    /// Set several environment keys in iteration order.
     #[must_use]
     pub fn envs<I, K, V>(mut self, vars: I) -> Self
     where
@@ -127,125 +188,76 @@ impl Command {
         self
     }
 
-    /// Set the working directory the child process is launched in.
+    /// Set the child working directory.
     #[must_use]
-    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(dir.into());
+    pub fn cwd(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(directory.into());
         self
     }
 
-    /// Set the working directory the child process is launched in.
-    ///
-    /// Alias for [`Command::cwd`] for call sites migrating from
-    /// `std::process::Command::current_dir`.
+    /// Alias for [`Command::cwd`].
     #[must_use]
-    pub fn current_dir(self, dir: impl Into<PathBuf>) -> Self {
-        self.cwd(dir)
+    pub fn current_dir(self, directory: impl Into<PathBuf>) -> Self {
+        self.cwd(directory)
     }
 
-    /// Configure the child's standard input.
+    /// Configure standard input.
     #[must_use]
     pub fn stdin(mut self, stdin: Stdio) -> Self {
         self.stdin = Some(stdin);
         self
     }
 
-    /// Configure the child's standard output.
+    /// Redirect or explicitly pipe standard output.
     #[must_use]
     pub fn stdout(mut self, stdout: Stdio) -> Self {
         self.stdout = Some(stdout);
         self
     }
 
-    /// Configure the child's standard error.
+    /// Redirect or explicitly pipe standard error.
     #[must_use]
     pub fn stderr(mut self, stderr: Stdio) -> Self {
         self.stderr = Some(stderr);
         self
     }
 
-    /// Set a wall-clock timeout for the invocation.
-    ///
-    /// WHY: every fleet subprocess must declare a deadline; sweeping subprocess
-    /// hangs into observable [`crate::Error::Timeout`] errors keeps the queue
-    /// liveness model honest. Callers that genuinely need an unbounded
-    /// invocation simply omit this method.
-    ///
-    /// The timeout is enforced by [`crate::run`] / [`crate::output`] /
-    /// [`crate::status`] and by [`crate::spawn`]. [`crate::spawn_child`]
-    /// cannot enforce it (the caller owns the raw child handle) — see its
-    /// documentation for how that mismatch surfaces.
+    /// Set the stdout capture policy.
     #[must_use]
-    pub fn timeout(mut self, dur: Duration) -> Self {
-        self.timeout = Some(dur);
+    pub fn capture_stdout(mut self, policy: CapturePolicy) -> Self {
+        self.stdout_capture = policy;
         self
     }
 
-    /// Run this invocation and return captured output for both zero and
-    /// non-zero exits.
-    ///
-    /// Convenience forwarding method for [`crate::output`]. The `io::Error`
-    /// preserves the underlying [`std::io::ErrorKind`] where one exists
-    /// (spawn/wait failures) and maps timeouts to
-    /// [`std::io::ErrorKind::TimedOut`].
-    pub fn output(self) -> std::io::Result<std::process::Output> {
-        crate::output(self)
-            .map(into_std_output)
-            .map_err(into_io_error)
-    }
-
-    /// Run this invocation and return its exit status for both zero and
-    /// non-zero exits.
-    ///
-    /// Convenience forwarding method for [`crate::status`]. The `io::Error`
-    /// preserves the underlying [`std::io::ErrorKind`] where one exists
-    /// (spawn/wait failures) and maps timeouts to
-    /// [`std::io::ErrorKind::TimedOut`].
-    pub fn status(self) -> std::io::Result<std::process::ExitStatus> {
-        crate::status(self).map_err(into_io_error)
-    }
-
-    /// Spawn this invocation and return the child handle.
-    ///
-    /// This preserves the child-handle shape needed by streaming callers while
-    /// keeping the raw process creation inside the epitelesis substrate. A
-    /// configured [`Command::timeout`] cannot be enforced on a raw handle —
-    /// see [`crate::spawn_child`] for how that mismatch surfaces.
-    pub fn spawn(self) -> std::io::Result<std::process::Child> {
-        crate::spawn_child(self)
-    }
-
-    /// Borrow the program path (used by runner implementations and tests).
+    /// Set the stderr capture policy.
     #[must_use]
-    pub fn program(&self) -> &std::path::Path {
+    pub fn capture_stderr(mut self, policy: CapturePolicy) -> Self {
+        self.stderr_capture = policy;
+        self
+    }
+
+    /// Borrow the configured program path.
+    #[must_use]
+    pub fn program(&self) -> &Path {
         &self.program
     }
 
-    /// Borrow the argument vector (used by runner implementations and tests).
+    /// Borrow the argument vector.
     #[must_use]
     pub fn arg_list(&self) -> &[OsString] {
         &self.args
     }
 
-    /// Iterate over configured arguments.
-    ///
-    /// Compatibility helper for migrated call sites that previously inspected
-    /// `std::process::Command` in tests.
+    /// Iterate over arguments.
     pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
         self.args.iter().map(OsString::as_os_str)
     }
 
-    /// Iterate over the *effective* environment configuration.
-    ///
-    /// Mirrors `std::process::Command::get_envs`: entries are sorted by key,
-    /// each key appears exactly once, and the value is `Some` for a variable
-    /// that will be set or `None` for one that will be removed. When a key was
-    /// passed to both [`Command::env`] and [`Command::env_remove`], the later
-    /// builder call wins — the same resolution the runners apply.
+    /// Iterate over explicit environment mutations in effective key order.
     pub fn get_envs(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
         let mut effective = std::collections::BTreeMap::new();
-        for op in &self.env_ops {
-            match op {
+        for operation in &self.env_ops {
+            match operation {
                 EnvOp::Set(key, value) => {
                     effective.insert(key.as_os_str(), Some(value.as_os_str()));
                 }
@@ -256,51 +268,167 @@ impl Command {
         }
         effective.into_iter()
     }
+}
 
-    /// Borrow the configured timeout, if any.
+impl Command<Ready> {
+    /// Borrow the validated execution policy.
     #[must_use]
-    pub fn timeout_value(&self) -> Option<Duration> {
-        self.timeout
+    pub fn execution_policy(&self) -> &ExecutionPolicy {
+        match self.execution.as_ref() {
+            Some(policy) => policy,
+            None => panic!("Ready typestate always contains an execution policy"),
+        }
+    }
+
+    /// Run and capture stdout and stderr.
+    pub fn output(self) -> Result<crate::Output> {
+        crate::output(self)
+    }
+
+    /// Run and return the exit status, including non-zero statuses.
+    pub fn status(self) -> Result<std::process::ExitStatus> {
+        crate::status(self)
+    }
+
+    /// Spawn a managed streaming child whose lifecycle remains enforced.
+    pub fn spawn(self) -> Result<crate::ManagedChild> {
+        crate::spawn_managed(self)
     }
 }
 
-impl std::fmt::Debug for Command {
+impl<State> std::fmt::Debug for Command<State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Command")
             .field("program", &self.program)
             .field("args", &self.args)
+            .field("environment", &self.environment)
             .field("env_ops", &self.env_ops)
             .field("cwd", &self.cwd)
             .field("stdin", &self.stdin.as_ref().map(|_| "configured"))
             .field("stdout", &self.stdout.as_ref().map(|_| "configured"))
             .field("stderr", &self.stderr.as_ref().map(|_| "configured"))
-            .field("timeout", &self.timeout)
+            .field("stdout_capture", &self.stdout_capture)
+            .field("stderr_capture", &self.stderr_capture)
+            .field("execution", &self.execution)
             .finish()
     }
 }
 
-fn into_std_output(output: crate::Output) -> std::process::Output {
-    std::process::Output {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
+pub(crate) struct PreparedCommand {
+    pub(crate) command: StdCommand,
+    pub(crate) program: String,
+    pub(crate) execution: ExecutionPolicy,
+    pub(crate) stdout_capture: CapturePolicy,
+    pub(crate) stderr_capture: CapturePolicy,
+}
+
+pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
+    validate_backend()?;
+    validate_path_policy(&command)?;
+
+    let Command {
+        program,
+        args,
+        environment,
+        env_ops,
+        cwd,
+        stdin,
+        stdout,
+        stderr,
+        stdout_capture,
+        stderr_capture,
+        execution,
+        state: _,
+    } = command;
+    let program_display = program.display().to_string();
+    let mut process = StdCommand::new(&program);
+    process.args(args);
+    process.env_clear();
+    match environment {
+        EnvironmentPolicy::Clean => {}
+        EnvironmentPolicy::Allowlist(keys) => {
+            for key in keys {
+                if let Some(value) = std::env::var_os(&key) {
+                    process.env(key, value);
+                }
+            }
+        }
+        EnvironmentPolicy::InheritAll(_) => {
+            process.envs(std::env::vars_os());
+        }
+    }
+    for operation in env_ops {
+        match operation {
+            EnvOp::Set(key, value) => {
+                process.env(key, value);
+            }
+            EnvOp::Remove(key) => {
+                process.env_remove(key);
+            }
+        }
+    }
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    process.stdin(stdin.unwrap_or_else(Stdio::null));
+    process.stdout(stdout.unwrap_or_else(Stdio::piped));
+    process.stderr(stderr.unwrap_or_else(Stdio::piped));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+
+    Ok(PreparedCommand {
+        command: process,
+        program: program_display,
+        execution: match execution {
+            Some(policy) => policy,
+            None => panic!("Ready typestate always contains an execution policy"),
+        },
+        stdout_capture,
+        stderr_capture,
+    })
+}
+
+fn validate_path_policy<State>(command: &Command<State>) -> Result<()> {
+    let has_separator = command.program.components().count() > 1;
+    if command.program.is_absolute() || has_separator {
+        return Ok(());
+    }
+
+    let path_key = OsStr::new("PATH");
+    let mut path_available =
+        command.environment.allows_key(path_key) && std::env::var_os(path_key).is_some();
+    for operation in &command.env_ops {
+        match operation {
+            EnvOp::Set(key, _) if key == path_key => path_available = true,
+            EnvOp::Remove(key) if key == path_key => path_available = false,
+            _ => {}
+        }
+    }
+    if path_available {
+        Ok(())
+    } else {
+        InvalidPolicySnafu {
+            violation: PolicyViolation::BareProgramWithoutPath(
+                command.program.as_os_str().to_os_string(),
+            ),
+        }
+        .fail()
     }
 }
 
-/// Convert a typed [`crate::Error`] into an `io::Error` that keeps the typed
-/// error as its source while preserving a meaningful [`std::io::ErrorKind`].
-///
-/// WHY: `Command::output` / `Command::status` mirror the `std::process`
-/// signatures for migrated call sites; those call sites match on
-/// `io::Error::kind()` (e.g. `NotFound` for a missing binary). Collapsing
-/// every failure to `ErrorKind::Other` would silently break that matching.
-fn into_io_error(error: crate::Error) -> std::io::Error {
-    let kind = match &error {
-        crate::Error::SpawnFailed { source, .. } | crate::Error::Io { source, .. } => source.kind(),
-        crate::Error::Timeout { .. } => std::io::ErrorKind::TimedOut,
-        // NOTE: NonZeroExit never reaches here (output/status return it as
-        // Ok); the arm also absorbs future #[non_exhaustive] variants.
-        _ => std::io::ErrorKind::Other,
-    };
-    std::io::Error::new(kind, error)
+#[cfg(unix)]
+fn validate_backend() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_backend() -> Result<()> {
+    crate::error::UnsupportedCapabilitySnafu {
+        capability: crate::error::Capability::OwnedProcessGroup,
+    }
+    .fail()
 }

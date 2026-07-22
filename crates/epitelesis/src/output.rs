@@ -1,45 +1,108 @@
-//! Captured output of a completed (or non-zero-exiting) invocation.
+//! Captured output and completeness evidence.
 
 use std::process::ExitStatus;
 use std::time::Duration;
 
-/// Result of a successfully *spawned* subprocess invocation.
+/// Identifies one standard output stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamName {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// Whether a captured byte prefix represents the complete stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CaptureCompleteness {
+    /// The pipe reached EOF and every byte was retained.
+    Complete,
+    /// The pipe reached EOF but bytes after the retained prefix were drained.
+    Truncated {
+        /// Number of drained but unretained bytes.
+        discarded: u64,
+    },
+    /// The stream was not connected to the supervisor capture pipe.
+    Redirected,
+}
+
+/// Bytes retained from one stream together with their completeness state.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CapturedStream {
+    /// Bounded prefix retained by the capture worker.
+    pub bytes: Vec<u8>,
+    /// Whether the bytes are complete, truncated, or redirected.
+    pub completeness: CaptureCompleteness,
+}
+
+impl CapturedStream {
+    pub(crate) fn complete(bytes: Vec<u8>, discarded: u64) -> Self {
+        let completeness = if discarded == 0 {
+            CaptureCompleteness::Complete
+        } else {
+            CaptureCompleteness::Truncated { discarded }
+        };
+        Self {
+            bytes,
+            completeness,
+        }
+    }
+
+    pub(crate) fn redirected() -> Self {
+        Self {
+            bytes: Vec::new(),
+            completeness: CaptureCompleteness::Redirected,
+        }
+    }
+
+    /// View retained bytes as UTF-8.
+    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.bytes)
+    }
+
+    /// Return the number of retained bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Return whether the retained prefix is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Result of a completed subprocess invocation.
 ///
-/// "Successfully spawned" means the kernel created the child process and the
-/// runner waited for it to exit; the child may still have failed (`status`
-/// reports a non-zero code). [`crate::run`] returns `Output` only for the
-/// success case (`status.success() == true`). Non-zero exits are surfaced as
-/// [`crate::Error::NonZeroExit`] which carries the same `Output` payload, so
-/// callers retain full access to stdout/stderr regardless of the path.
-#[derive(Debug, Clone)]
+/// This type is intentionally not `Clone`: a non-zero error owns the sole
+/// status and buffer payload instead of duplicating potentially large output.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct Output {
     /// Exit status reported by the kernel.
     pub status: ExitStatus,
-    /// Bytes captured from the child's standard output.
-    pub stdout: Vec<u8>,
-    /// Bytes captured from the child's standard error.
-    pub stderr: Vec<u8>,
-    /// Wall-clock time between spawn and reap.
+    /// Captured stdout and completeness evidence.
+    pub stdout: CapturedStream,
+    /// Captured stderr and completeness evidence.
+    pub stderr: CapturedStream,
+    /// Wall-clock time from spawn through reap and capture settlement.
     pub duration: Duration,
 }
 
 impl Output {
-    /// View `stdout` as a UTF-8 string slice.
-    ///
-    /// Returns the underlying [`std::str::Utf8Error`] if the output is not
-    /// valid UTF-8 (callers consuming binary stdout work with `.stdout`
-    /// directly).
+    /// View retained stdout as UTF-8.
     pub fn stdout_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.stdout)
+        self.stdout.as_str()
     }
 
-    /// View `stderr` as a UTF-8 string slice.
+    /// View retained stderr as UTF-8.
     pub fn stderr_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.stderr)
+        self.stderr.as_str()
     }
 
-    /// Whether the child exited with status `0`.
+    /// Whether the leader exited successfully.
     #[must_use]
     pub fn success(&self) -> bool {
         self.status.success()

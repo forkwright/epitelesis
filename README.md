@@ -1,84 +1,61 @@
 # epitelesis
 
-*ἐπιτέλεσις  -  the process of executing-to-completion.*
+*ἐπιτέλεσις — the process of executing-to-completion.*
 
-The project-wide command-execution wrapper substrate for the forkwright fleet.
-Every production subprocess invocation goes through one place: argument
-assembly, environment and working-directory passthrough, timeout enforcement,
-stdout/stderr capture, structured errors, and tracing spans live here so
-consumers stop reinventing them per call site.
-
-## Why
-
-Direct `std::process::Command` use is forbidden in fleet code by the
-[`RUST/no-direct-process-command`](https://github.com/forkwright/kanon/blob/main/crates/basanos/standards/RUST.md#command-execution)
-rule. Raw `Command` invites forgotten timeout configuration, missed exit-code
-handling, dropped argument quoting, and ad-hoc error types callers cannot match
-on. Epitelesis centralises those concerns behind a single typed surface.
+Epitelesis is the forkwright fleet's structurally safe subprocess substrate.
+It makes lifetime, environment, capture bounds, process-group ownership, and
+cleanup evidence part of the API rather than caller convention.
 
 ## Quickstart
-
-```toml
-[dependencies]
-epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.1.0" }
-```
 
 ```rust
 use epitelesis::{Command, run};
 use std::time::Duration;
 
 let output = run(
-    Command::new("git")
+    Command::new("/usr/bin/git")
         .arg("status")
         .arg("--porcelain")
-        .timeout(Duration::from_secs(5)),
+        .deadline(Duration::from_secs(5))?,
 )?;
-assert!(output.success());
 # Ok::<(), epitelesis::Error>(())
 ```
 
-## Surface
+`Command::new` returns `Command<Draft>`, which no runner accepts. A validated
+`.deadline(...)` or `.unbounded(non_empty_reason)` produces `Command<Ready>`.
+Deadline overflow is an `InvalidPolicy` error before spawn.
+
+## Safety defaults
+
+- The child environment begins with `env_clear`; choose Clean (default), an
+  allowlist, or full inheritance with a non-empty reason. Explicit set/remove
+  operations apply afterward. Bare names require an explicitly available PATH.
+- Stdout and stderr independently fail closed at 10 MiB by default. Callers may
+  choose a smaller/larger bound, bounded truncate-and-drain, or exceptional
+  unbounded capture with a reason.
+- Output distinguishes complete empty capture from redirection and records
+  exact discarded-byte counts for truncation.
+- On Unix, every child leads an owned process group. Timeout, capture limit,
+  cancellation, async-future drop, and managed-handle drop signal the group,
+  observe leader exit without reaping, then reap and settle capture.
+- Non-Unix platforms return `UnsupportedCapability(OwnedProcessGroup)` before
+  spawn until a Job Object backend exists.
+
+## Public surface
 
 | Item | Role |
 |---|---|
-| `Command` | Builder capturing program, args, env, cwd, timeout, stdio. |
-| `run` | Synchronous executor returning `Output` (success) or typed `Error`. |
-| `output` | Synchronous captured-output helper preserving non-zero output. |
-| `status` | Synchronous status helper preserving non-zero status. |
-| `spawn_child` | Synchronous child-handle helper for streaming callers. |
-| `spawn` | Asynchronous executor (gated by the `async` Cargo feature). |
-| `Output` | Captured status, stdout, stderr, and elapsed duration. |
-| `Error` | Typed error variants (snafu, `#[non_exhaustive]`). |
+| `Command<Draft/Ready>` | Typestate invocation builder. |
+| `run`, `output`, `status` | Synchronous adapters over the shared supervisor. |
+| `spawn` | Tokio adapter behind the `async` feature. |
+| `spawn_managed`, `ManagedChild` | Streaming handle with background enforcement and no raw escape. |
+| `CapturePolicy`, `EnvironmentPolicy` | Explicit capture and environment choices. |
+| `Output`, `CapturedStream` | Sole owned status/buffers plus completeness evidence. |
+| `Error` | Primary outcome with typed secondary signal/reap/capture/cleanup evidence. |
 
-## Cargo features
-
-| Feature | What it enables |
-|---|---|
-| (default) | Sync `run` / `output` / `status` / `spawn_child` over `std::process::Command`. |
-| `async` | Adds `epitelesis::spawn` over `tokio::process::Command` and pulls tokio. |
-
-## Errors
-
-The error surface is typed and `#[non_exhaustive]`, so consumers match on
-variant without losing the underlying `io::Error` chain:
-
-- `Error::SpawnFailed`  -  kernel refused to spawn the child (program not on
-  `PATH`, permission denied, fork failure).
-- `Error::NonZeroExit`  -  child spawned and exited with a non-zero status.
-  Carries the captured `Output` payload so callers retain access to
-  `stdout`/`stderr`/`status` even on failure.
-- `Error::Timeout`  -  configured `Command::timeout` elapsed; the runner has
-  already killed and reaped the child by the time this error returns.
-  Carries the partial `stdout`/`stderr` captured before the deadline.
-- `Error::Io`  -  IO failure while waiting on the child or capturing output.
-
-## Consumers
-
-Today, every crate of [forkwright/kanon](https://github.com/forkwright/kanon)
-(the fleet's standards and dispatch toolkit) that spawns a subprocess:
-`pragma`, `archeion`, `basanos`, `angelos`, `kanon`, `mnemosyne`, `stoa`.
-Future fleet consumers take a hard dependency on this crate instead of
-reinventing the wrapper.
+Process groups contain ordinary descendants; they are not a hostile-child
+sandbox. A child that calls `setsid` can escape, and an escaped pipe owner is
+reported truthfully as `CleanupIncomplete` after bounded cleanup.
 
 ## License
 

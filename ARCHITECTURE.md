@@ -1,58 +1,46 @@
 # Architecture
 
-Epitelesis is the fleet's command-execution substrate. It ships one Rust
-crate from one workspace and exposes a single typed surface every consumer
-goes through to spawn subprocesses.
+Epitelesis owns an invocation from policy declaration through process-group
+settlement and leader reap. Public sync, Tokio, and managed-streaming surfaces
+are thin adapters over one private supervisor state machine.
 
 ## Layers
 
 ```
-consumer crates (kanon::pragma, kanon::archeion, kanon::basanos, …,
-                 future fleet crates)
-        │
-        ▼
-epitelesis::{Command, run, output, status, spawn_child, spawn}
-        │
-        ▼
-std::process::Command  /  tokio::process::Command (feature = "async")
+Command<Draft>
+    │ deadline(duration) / unbounded(reason)
+    ▼
+Command<Ready> ── validate env/PATH/backend before spawn
+    ▼
+Unix owned process group + armed child guard
+    ▼
+serialized exit / deadline / limit / cancellation outcome
+    ▼
+signal group → observe leader exit without reap → reap → settle capture
 ```
 
-The crate is intentionally thin. Its job is centralisation, not
-abstraction-for-its-own-sake — every fleet subprocess passes through one
-place so argument assembly, env/cwd passthrough, timeout enforcement,
-stdout/stderr capture, structured errors, and tracing spans live in one
-file each instead of being reinvented per call site.
+Non-Unix backends return `UnsupportedCapability(OwnedProcessGroup)` before
+spawn. They do not silently degrade to direct-child ownership. A future Windows
+implementation must use a Job Object.
 
 ## Modules
 
 | Module | Role |
 |---|---|
-| `command` | Builder type capturing program, args, env, cwd, timeout, stdio. Not `Clone` by design — each invocation owns its configuration. |
-| `output` | Captured `Output` (status + stdout + stderr + elapsed duration). Returned by `run` on success and carried inside `Error::NonZeroExit` on failure. |
-| `error` | Typed `Error` enum (snafu, `#[non_exhaustive]`) with `SpawnFailed`, `NonZeroExit`, `Timeout`, `Io` variants. |
-| `sync` | Sync runners (`run`, `output`, `status`, `spawn_child`) over `std::process::Command`. Concurrent pipe drain via dedicated reader threads so children writing more than the OS pipe buffer (~64 KiB) do not deadlock against `wait()`. Every failure path (timeout or wait IO error) reaps the child and joins the drain threads before returning. |
-| `async_impl` | Async `spawn` over `tokio::process::Command` (feature = `async`). Mirrors the sync semantics by construction — the child is assembled from the same builder-to-process translation the sync path uses, so stdio defaults/overrides and env call-order resolution cannot drift: success returns `Output`, non-zero exit returns `Error::NonZeroExit` with the payload, exceeded timeout kills the child and returns `Error::Timeout` with the partial output. |
+| `policy` | Typestate markers and explicit lifetime, environment, and capture policies. |
+| `command` | Non-clone builder, pre-spawn validation, `env_clear` translation, and Unix process-group configuration. |
+| `supervisor` | Private event-driven state machine, bounded capture workers, safe rustix signaling/wait observation, and armed lifecycle guard. |
+| `managed` | Restricted streaming handle backed by a background supervisor. |
+| `sync` | `run`, `output`, and `status` adapters. |
+| `async_impl` | Tokio `spawn` adapter with future-drop cancellation. |
+| `output` | Captured prefixes plus complete/truncated/redirected evidence. |
+| `error` | Primary typed outcomes and retained secondary cleanup evidence. |
 
-## Public surface
+## Containment boundary
 
-Every `pub` item reachable from the crate root and every Cargo feature exposed
-by the crate is the SemVer contract:
-
-- `Command` builder methods, `Output` fields/methods, `Error` variants and
-  variant fields, `run`/`output`/`status`/`spawn_child` signatures, and
-  `spawn` signature (under `feature = "async"`).
-- Adding variants is non-breaking (the enum is `#[non_exhaustive]`).
-- Removing or renaming any of the above is a major version bump.
-
-## Consumer boundary
-
-Epitelesis does not own retry policy, command-discovery (PATH lookups),
-sandboxing, or any domain-specific subprocess vocabulary (git, ssh, …). Those
-stay in the consuming crate. Epitelesis owns the substrate that every
-subprocess invocation passes through; consumers compose on top.
-
-## Why one crate, one workspace
-
-A workspace at root (instead of a bare single-crate layout) leaves room for
-sibling helpers (an `epitelesis-cli` smoke binary, a test-helper crate for
-fixtures) without restructuring. Today the workspace has one member.
+`process_group(0)` contains the leader and ordinary descendants. It is not a
+hostile-child sandbox: a descendant can call `setsid` and escape. If an escaped
+process retains a capture pipe past the shared cleanup deadline, the supervisor
+returns `CleanupIncomplete` with exact unfinished streams and may leave only
+those reader threads alive. Ordinary in-group descendants are signaled and all
+capture workers settle before return.
