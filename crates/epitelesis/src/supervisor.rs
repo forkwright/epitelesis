@@ -462,10 +462,13 @@ mod unix {
                 Err(failure) => observations.reap_failures.push(failure),
             }
         }
-        let unfinished_streams = [(&stdout, StreamName::Stdout), (&stderr, StreamName::Stderr)]
-            .into_iter()
-            .filter_map(|(stream, name)| (!stream.terminal()).then_some(name))
-            .collect::<Vec<_>>();
+        let unfinished_streams = [
+            (!stdout.terminal()).then_some(StreamName::Stdout),
+            (!stderr.terminal()).then_some(StreamName::Stderr),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         let cleanup = if leader_unsettled || !unfinished_streams.is_empty() {
             CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
                 unfinished_streams,
@@ -975,7 +978,7 @@ mod unix {
     }
 
     fn start_background_reaper(program: &str) -> Result<mpsc::SyncSender<Child>> {
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel::<Child>(1);
         let _reaper = thread::Builder::new()
             .name("epitelesis-background-reaper".to_owned())
             .spawn(move || {
