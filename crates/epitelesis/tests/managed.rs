@@ -11,6 +11,9 @@
     ))
 ))]
 
+#[cfg(target_os = "linux")]
+mod support;
+
 use std::fmt::Debug;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
@@ -209,10 +212,8 @@ fn wait_for_terminal_poll(child: &mut epitelesis::ManagedChild, success: bool) {
 fn wait_for_pid(path: &std::path::Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if let Ok(value) = std::fs::read_to_string(path)
-            && value.ends_with('\n')
-        {
-            return value.trim().parse().must("pid is numeric");
+        if let Some(pid) = support::read_complete_pid(path).must("pid is numeric") {
+            return pid;
         }
         assert!(Instant::now() < deadline, "child never became ready");
         std::thread::yield_now();

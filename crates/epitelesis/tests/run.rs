@@ -11,6 +11,9 @@
     ))
 ))]
 
+#[cfg(target_os = "linux")]
+mod support;
+
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
@@ -439,17 +442,7 @@ fn escaped_session_surfaces_truthful_cleanup_incomplete() {
     assert!(elapsed >= leader_lifetime);
     assert!(elapsed <= leader_lifetime + CLEANUP_ALLOWANCE);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let pid = loop {
-        if let Ok(value) = std::fs::read_to_string(&pidfile) {
-            break value.trim().parse::<i32>().must("pid is numeric");
-        }
-        assert!(
-            Instant::now() < deadline,
-            "escaped child never wrote pidfile"
-        );
-        std::thread::yield_now();
-    };
+    let pid = i32::try_from(wait_for_pid(&pidfile)).must("pid fits i32");
     if let Some(pid) = Pid::from_raw(pid) {
         let _ = kill_process(pid, Signal::KILL);
     }
@@ -459,8 +452,8 @@ fn escaped_session_surfaces_truthful_cleanup_incomplete() {
 fn wait_for_pid(path: &std::path::Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if let Ok(value) = std::fs::read_to_string(path) {
-            return value.trim().parse().must("pid is numeric");
+        if let Some(pid) = support::read_complete_pid(path).must("pid is numeric") {
+            return pid;
         }
         assert!(Instant::now() < deadline, "child never became ready");
         std::thread::yield_now();
