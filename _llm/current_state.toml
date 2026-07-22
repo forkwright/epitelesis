@@ -4,24 +4,39 @@ repo = "forkwright/epitelesis"
 generated = false
 source_docs = [
   "README.md",
-  "CHANGELOG.md",
+  "Cargo.toml",
+  "Cargo.lock",
+  ".release-please-manifest.json",
+  "ARCHITECTURE.md",
 ]
 
 [state]
-summary = "Initial extraction from forkwright/kanon (D-067 Tier B EXTRACT-NOW). Single crate, sync runners stable, async runner gated by feature."
-current_phase = "Post-extraction stabilisation; consumer cutover via kanon workspace dep rewire (forkwright/kanon PR)."
-updated = "2026-05-28"
+release_version = "0.2.0" # x-release-please-version
+release_status = "The workspace, local lockfile package, manifest, README pin, machine state, and ancestral local tag agree."
+contract_status = "The breaking v1 invocation and supervisor contract is implemented on the convergence branch and awaits exact-head hosted compilation and gate evidence."
+updated = "2026-07-22"
 
-[[recent]]
-date = "2026-05-28"
-item = "Extracted from kanon (crates/epitelesis -> forkwright/epitelesis). Initial scaffold + standards + workflows landed."
+[state.v1_contract]
+deadline = "Typestate requires bounded execution or unbounded execution with a reason."
+environment = "Clean/env_clear by default; Allowlist selective; InheritAll reason-bearing."
+capture = "10 MiB per stream by default, fail-closed; truncation and exceptional unbounded capture are explicit, while streaming is a structural transition."
+supervision = "One fair nonblocking poll loop owns both capture pipes, kills the Unix process group before reap, and aggregates boxed lifecycle evidence."
+managed_child = "ManagedChild owns deadline, cancellation, and reap; the caller explicitly owns streaming bytes and backpressure."
+portability = "Non-Unix and Unix targets without rustix waitid support return typed unsupported capability before spawn."
+sandbox = "Process groups are not a security sandbox because hostile children can call setsid."
 
-[[open_threads]]
-name = "kanon consumer cutover"
-issue = 0
-status = "Coordinated forkwright/kanon PR drops crates/epitelesis from the workspace and rewires the workspace dep as git = forkwright/epitelesis. Merges after this repo's #1."
+[state.release_verification]
+ordinary = "All five release files must align and the selected local tag must be an ancestor of HEAD."
+prospective = "Only authenticated Release Please policy may allow an untagged version, with an ancestral explicit base and all five files changed together."
+files = [
+  "Cargo.toml",
+  "Cargo.lock",
+  ".release-please-manifest.json",
+  "README.md",
+  "_llm/current_state.toml",
+]
 
-[[open_threads]]
-name = "v0.1.0 release tag"
-issue = 0
-status = "release-please opens the first release PR after #1 lands; tag v0.1.0 becomes the pin target for kanon."
+[state.hosted_gate]
+protected_context = "gate / gate-attestation"
+policy = "Release verification runs before fail-closed path classification."
+build = "Only exact prose files skip; every code-affecting change requires the Ubuntu 24.04 full gate."

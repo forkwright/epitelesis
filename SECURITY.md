@@ -2,63 +2,66 @@
 
 ## Reporting vulnerabilities
 
-**Do not open a public GitHub issue for security vulnerabilities.**
+Do not open a public issue for a vulnerability. Use the repository's private
+[GitHub security advisory form](https://github.com/forkwright/epitelesis/security/advisories/new).
 
-Report privately via GitHub's security advisory system:
+Include a description, reproduction steps, potential impact, affected release
+or commit, and any suggested remediation.
 
-> https://github.com/forkwright/epitelesis/security/advisories/new
+## Security boundary
 
-Include: description, reproduction steps, potential impact, affected
-version or commit, and any suggested fix.
+Epitelesis enforces subprocess lifecycle policy; it is not a security sandbox.
+On a supported Unix backend the supervisor kills the process group before
+reaping so ordinary descendants are cleaned up. Captured pipes are nonblocking
+and share the supervisor event loop; a noisy stream receives only a bounded
+turn before deadline and cancellation checks resume. A hostile child can call
+`setsid`, escape the group, and survive. Use a purpose-built OS sandbox or
+container when executing hostile code.
 
-## Response SLA
+The v1 defaults reduce accidental exposure and resource exhaustion:
 
-| Severity | Acknowledgment | Fix Target |
-|----------|----------------|------------|
-| Critical (CVSS >= 9.0) | 24 hours | 7 days |
-| High (CVSS 7.0-8.9) | 48 hours | 14 days |
-| Medium (CVSS 4.0-6.9) | 5 days | 30 days |
-| Low (CVSS < 4.0) | 10 days | 90 days |
+- `Clean` uses real environment clearing;
+- environment allowlisting is explicit;
+- inheriting the full environment requires a recorded reason;
+- stdout and stderr are each limited to 10 MiB by default and limits fail
+  closed; and
+- deadlines are mandatory unless explicitly waived with a reason.
 
-## Scope
+Explicit unbounded execution or capture is an exceptional policy choice, not a
+safety guarantee. The caller owns the justification and the resulting resource
+risk.
 
-**In scope:**
+## Evidence handling
 
-- Argument-quoting, environment, or working-directory handling bugs in the
-  `Command` builder that could trigger unintended subprocess behaviour.
-- Timeout / wait / kill logic failures that could leak child processes,
-  block indefinitely, or misreport `Error::Timeout`.
-- Capture-path bugs that could leak credentials in stdout/stderr beyond the
-  caller's intended sink.
-- Build-script or dependency behaviour that creates a practical
-  vulnerability in epitelesis consumers.
+Captured stdout and stderr are untrusted bytes and may contain secrets. The
+library transports them; callers own redaction, storage, retention, and safe
+rendering. Tracing must not record argument values, inherited environment
+values, or captured output by default.
 
-**Out of scope:**
+Lifecycle errors retain one aggregate evidence object containing typed signal
+and reap outcomes, both capture reports, recoverable elapsed time, and the
+typed cleanup outcome. Incomplete capture means EOF was not observed, whether
+because reading failed or the cleanup deadline expired. A
+`CleanupOutcome::Incomplete` value specifically means that deadline expired
+without proof of full settlement; `Unknown` means an adapter could not recover
+the evidence. Security-sensitive callers should inspect the whole typed result
+instead of treating timeout or cancellation as proof that every descendant was
+contained.
 
-- Social engineering.
-- Physical access attacks.
-- Vulnerabilities that require arbitrary local code execution before
-  epitelesis APIs are called.
-- Misuse of the wrapper by a caller (passing untrusted input as `program`
-  or unvalidated args, etc.). Those are caller-side issues; report to the
-  consuming repo.
-- Issues only present in upstream dependencies and not made worse by
-  epitelesis; report those upstream. Epitelesis will patch promptly when a
-  dependency fix is available.
+## In scope
+
+- policy bypasses that allow execution without a declared deadline;
+- environment clearing or allowlist failures;
+- capture-limit, drain, cancellation, kill, or reap failures;
+- evidence loss that masks incomplete cleanup; and
+- dependency or build behavior that creates a practical vulnerability for
+  consumers.
+
+Misuse by a caller—such as executing an untrusted program without a sandbox,
+passing unvalidated arguments, or publishing raw captured output—is outside the
+library's security boundary unless Epitelesis makes the outcome worse.
 
 ## Disclosure
 
-After a fix ships, we publish a GitHub Security Advisory when warranted,
-including affected versions, fixed version, impact, remediation, and credit
-to the reporter.
-
-## Security Standards
-
-Epitelesis follows the fleet security standards maintained in
-`kanon/crates/basanos/standards/SECURITY.md`. In particular:
-
-- Do not log credentials, tokens, or sensitive arguments unless explicitly
-  redacted. The tracing spans this crate opens record `program` and
-  `arg_count` — never the argument values.
-- Treat the captured `Output.stdout` / `Output.stderr` as untrusted byte
-  buffers in callers; epitelesis is a transport, not a sanitiser.
+After a fix ships, maintainers may publish a GitHub Security Advisory with the
+affected releases, impact, remediation, and reporter credit.

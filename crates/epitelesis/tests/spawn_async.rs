@@ -1,185 +1,259 @@
-//! Integration coverage for `epitelesis::spawn` (async, gated by the `async`
-//! feature). Mirrors the sync surface so we catch divergence between the two
-//! runners.
+//! Async adapter lifecycle coverage.
 
 #![cfg(feature = "async")]
-// WHY: Integration tests legitimately use expect/unwrap/panic for setup
-// failures so the named step surfaces directly in the failure message.
-#![expect(
-    clippy::expect_used,
-    reason = "integration tests assert on the named subprocess step; expect surfaces the failing fixture"
-)]
+#![cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
 
-use std::process::Stdio;
-use std::time::Duration;
+#[cfg(target_os = "linux")]
+mod support;
 
-use epitelesis::{Command, Error, spawn};
+use std::fmt::Debug;
+use std::time::{Duration, Instant};
 
-#[tokio::test]
-async fn async_simple_success_returns_output() {
-    let output = spawn(Command::new("true"))
-        .await
-        .expect("`true` always succeeds");
-    assert!(output.success());
+use epitelesis::{
+    CLEANUP_ALLOWANCE, CaptureCompleteness, CapturePolicy, Command, EnvironmentPolicy, Error, spawn,
+};
+
+trait Must<T> {
+    fn must(self, context: &str) -> T;
 }
 
-#[tokio::test]
-async fn async_non_zero_exit_returns_typed_error() {
-    let err = spawn(Command::new("false"))
-        .await
-        .expect_err("`false` always exits 1");
-    assert!(matches!(err, Error::NonZeroExit { .. }));
-}
-
-#[tokio::test]
-async fn async_timeout_kills_long_running_child() {
-    let started = std::time::Instant::now();
-    let err = spawn(
-        Command::new("sleep")
-            .arg("30")
-            .timeout(Duration::from_millis(150)),
-    )
-    .await
-    .expect_err("sleep 30 must be killed before completion");
-    assert!(matches!(err, Error::Timeout { .. }));
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "tokio::time::timeout must fire well before the child completes"
-    );
-}
-
-#[tokio::test]
-async fn async_env_passthrough_reaches_child_process() {
-    // WHY: async/sync parity — the builder's env must apply identically on
-    // the tokio path.
-    let output = spawn(
-        Command::new("printenv")
-            .arg("EPITELESIS_ASYNC_TOKEN")
-            .env("EPITELESIS_ASYNC_TOKEN", "telos-acknowledged"),
-    )
-    .await
-    .expect("printenv with the var set must exit 0");
-    assert_eq!(
-        output
-            .stdout_str()
-            .expect("printenv emits utf-8")
-            .trim_end(),
-        "telos-acknowledged"
-    );
-}
-
-#[tokio::test]
-async fn async_env_remove_after_env_removes_the_var() {
-    // WHY: regression for the async path silently dropping env_remove — the
-    // builder contract must hold identically on both runners.
-    let err = spawn(
-        Command::new("printenv")
-            .arg("EPITELESIS_ASYNC_ORDER")
-            .env("EPITELESIS_ASYNC_ORDER", "should-be-removed")
-            .env_remove("EPITELESIS_ASYNC_ORDER"),
-    )
-    .await
-    .expect_err("printenv on an absent var exits 1");
-    assert!(
-        matches!(err, Error::NonZeroExit { .. }),
-        "the later env_remove must win over the earlier env, got {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn async_env_after_env_remove_resets_the_var() {
-    let output = spawn(
-        Command::new("printenv")
-            .arg("EPITELESIS_ASYNC_ORDER")
-            .env_remove("EPITELESIS_ASYNC_ORDER")
-            .env("EPITELESIS_ASYNC_ORDER", "restored"),
-    )
-    .await
-    .expect("the later env must win over the earlier env_remove");
-    assert_eq!(
-        output
-            .stdout_str()
-            .expect("printenv emits utf-8")
-            .trim_end(),
-        "restored"
-    );
-}
-
-#[tokio::test]
-async fn async_stdout_override_is_honored() {
-    // WHY: regression for the async path hardcoding piped stdio — a caller
-    // redirecting stdout away from the pipe must get the same behaviour as
-    // the sync runner (nothing captured).
-    let output = spawn(
-        Command::new("echo")
-            .arg("discarded")
-            .stdout(Stdio::null())
-            .timeout(Duration::from_secs(10)),
-    )
-    .await
-    .expect("echo must exit 0");
-    assert!(output.success(), "expected zero exit");
-    assert!(
-        output.stdout.is_empty(),
-        "stdout redirected to null must not be captured"
-    );
-}
-
-#[tokio::test]
-async fn async_piped_stdin_is_closed_so_a_reading_child_sees_eof() {
-    let started = std::time::Instant::now();
-    let output = spawn(
-        Command::new("cat")
-            .stdin(Stdio::piped())
-            .timeout(Duration::from_secs(30)),
-    )
-    .await
-    .expect("cat on a closed stdin exits 0 immediately");
-    assert!(output.success(), "expected zero exit");
-    assert!(output.stdout.is_empty(), "no input, no output");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "cat must see EOF at once, not wait out the timeout"
-    );
-}
-
-#[tokio::test]
-async fn async_timeout_error_carries_partial_output() {
-    // WHY: parity with the sync runner — partial output captured before the
-    // deadline must survive into the Timeout payload.
-    let err = spawn(
-        Command::new("sh")
-            .args([
-                "-c",
-                "printf early-stdout; printf early-stderr >&2; sleep 30",
-            ])
-            .timeout(Duration::from_millis(500)),
-    )
-    .await
-    .expect_err("the trailing sleep must exceed the timeout");
-    match err {
-        Error::Timeout { stdout, stderr, .. } => {
-            assert_eq!(
-                stdout, b"early-stdout",
-                "stdout written before the deadline must survive the kill"
-            );
-            assert_eq!(
-                stderr, b"early-stderr",
-                "stderr written before the deadline must survive the kill"
-            );
+impl<T, E: Debug> Must<T> for Result<T, E> {
+    fn must(self, context: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error:?}"),
         }
-        other => panic!("expected Timeout, got {other:?}"),
     }
 }
 
-// WHY: regression for the `Span::enter()` guard held across `.await`: on a
-// single worker thread, a suspended spawn() future must NOT leave its span
-// installed as the thread-local current span, or every other task polled on
-// that thread has its events attributed to `epitelesis.spawn`. The probe
-// task interleaves with two concurrent spawns on a current_thread runtime
-// and asserts it never observes their span as current.
+impl<T> Must<T> for Option<T> {
+    fn must(self, context: &str) -> T {
+        match self {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+}
+
+trait MustErr<E> {
+    fn must_err(self, context: &str) -> E;
+}
+
+impl<T: Debug, E> MustErr<E> for Result<T, E> {
+    fn must_err(self, context: &str) -> E {
+        match self {
+            Err(error) => error,
+            Ok(value) => panic!("{context}: unexpectedly succeeded with {value:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn async_success_and_timeout_match_sync_contract() {
+    let output = spawn(
+        Command::new("/bin/true")
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("true exits zero");
+    assert!(output.success());
+
+    let error = spawn(
+        Command::new("/bin/sleep")
+            .arg("30")
+            .deadline(Duration::from_millis(100))
+            .must("deadline is valid"),
+    )
+    .await
+    .must_err("sleep exceeds deadline");
+    assert!(matches!(error, Error::Timeout { .. }));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_async_future_cancels_background_descendant() {
+    let directory = tempfile::tempdir().must("scratch directory");
+    let leaderfile = directory.path().join("leader.pid");
+    let pidfile = directory.path().join("descendant.pid");
+    let script = format!(
+        "echo $$ > {}; /bin/sleep 30 & echo $! > {}; wait",
+        leaderfile.display(),
+        pidfile.display()
+    );
+    let task = tokio::spawn(spawn(
+        Command::new("/bin/sh")
+            .args(["-c", &script])
+            .deadline(Duration::from_secs(30))
+            .must("deadline is valid"),
+    ));
+    let leader = wait_for_pid(&leaderfile).await;
+    let pid = wait_for_pid(&pidfile).await;
+    task.abort();
+    let _ = task.await;
+    wait_until_gone(leader).await;
+    wait_until_gone(pid).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn async_timeout_kills_background_descendant_holding_pipes() {
+    let directory = tempfile::tempdir().must("scratch directory");
+    let leaderfile = directory.path().join("leader.pid");
+    let pidfile = directory.path().join("descendant.pid");
+    let script = format!(
+        "echo $$ > {}; /bin/sleep 30 & echo $! > {}; wait",
+        leaderfile.display(),
+        pidfile.display()
+    );
+    let configured_deadline = Duration::from_secs(1);
+    let task = tokio::spawn(spawn(
+        Command::new("/bin/sh")
+            .args(["-c", &script])
+            .deadline(configured_deadline)
+            .must("deadline is valid"),
+    ));
+    let leader = wait_for_pid(&leaderfile).await;
+    let pid = wait_for_pid(&pidfile).await;
+    let error = task
+        .await
+        .must("timeout task joins")
+        .must_err("background descendant exceeds deadline");
+    let elapsed = match error {
+        Error::Timeout { evidence, .. } => evidence.elapsed.must("elapsed evidence is known"),
+        other => panic!("expected Timeout, got {other:?}"),
+    };
+    assert!(elapsed >= configured_deadline);
+    assert!(elapsed <= configured_deadline + CLEANUP_ALLOWANCE);
+    wait_until_gone(leader).await;
+    wait_until_gone(pid).await;
+}
+
+#[tokio::test]
+async fn async_fast_exit_overflow_and_truncation_match_sync() {
+    for (script, expected) in [
+        (
+            "printf 123456; printf peer >&2",
+            epitelesis::StreamName::Stdout,
+        ),
+        (
+            "printf peer; printf 123456 >&2",
+            epitelesis::StreamName::Stderr,
+        ),
+    ] {
+        for _ in 0..32 {
+            let error = spawn(
+                Command::new("/bin/sh")
+                    .args(["-c", script])
+                    .capture_stdout(CapturePolicy::bounded(5))
+                    .capture_stderr(CapturePolicy::bounded(5))
+                    .deadline(Duration::from_secs(2))
+                    .must("deadline is valid"),
+            )
+            .await
+            .must_err("cap plus one cannot return success");
+            assert!(matches!(
+                error,
+                Error::CaptureLimitExceeded { stream, .. } if stream == expected
+            ));
+        }
+    }
+
+    let output = spawn(
+        Command::new("/bin/sh")
+            .args(["-c", "printf 123456"])
+            .capture_stdout(CapturePolicy::truncate(5))
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("truncation drains to EOF");
+    assert_eq!(output.evidence.stdout.captured.bytes, b"12345");
+    assert_eq!(
+        output.evidence.stdout.captured.completeness,
+        CaptureCompleteness::Truncated { discarded: 1 }
+    );
+}
+
+#[tokio::test]
+async fn async_environment_and_nonzero_match_sync() {
+    let clean = spawn(
+        Command::new("/usr/bin/env")
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("clean env exits zero");
+    assert!(clean.evidence.stdout.captured.is_empty());
+
+    let allowlisted = spawn(
+        Command::new("/usr/bin/printenv")
+            .arg("PATH")
+            .environment(EnvironmentPolicy::allowlist(["PATH"]))
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("allowlisted env exits zero");
+    assert!(!allowlisted.evidence.stdout.captured.is_empty());
+
+    let error = spawn(
+        Command::new("/bin/false")
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must_err("nonzero remains typed");
+    assert!(matches!(error, Error::NonZeroExit { .. }));
+}
+
+#[tokio::test]
+async fn async_missing_program_stdio_override_and_piped_stdin_match_sync() {
+    let missing = spawn(
+        Command::new("/definitely/does/not/exist/epitelesis-test-binary")
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must_err("missing program cannot spawn");
+    assert!(matches!(missing, Error::SpawnFailed { .. }));
+
+    let redirected = spawn(
+        Command::new("/bin/sh")
+            .args(["-c", "printf discarded"])
+            .stdout(std::process::Stdio::null())
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("redirected command exits");
+    assert_eq!(
+        redirected.evidence.stdout.captured.completeness,
+        CaptureCompleteness::Redirected
+    );
+
+    let eof = spawn(
+        Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
+    )
+    .await
+    .must("capturing supervisor closes stdin");
+    assert!(eof.success());
+}
+
 #[tokio::test(flavor = "current_thread")]
-async fn concurrent_spawn_does_not_leak_span_onto_other_tasks() {
+async fn concurrent_async_supervisors_do_not_leak_tracing_spans() {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::level_filters::LevelFilter::TRACE)
         .with_writer(std::io::sink)
@@ -192,26 +266,47 @@ async fn concurrent_spawn_does_not_leak_span_onto_other_tasks() {
             let name = tracing::Span::current()
                 .metadata()
                 .map(|metadata| metadata.name().to_owned());
-            assert_ne!(
-                name.as_deref(),
-                Some("epitelesis.spawn"),
-                "a suspended spawn() future leaked its span onto the worker thread"
-            );
+            assert_ne!(name.as_deref(), Some("epitelesis.supervise"));
         }
     };
-
     let first = spawn(
-        Command::new("sleep")
+        Command::new("/bin/sleep")
             .arg("0.3")
-            .timeout(Duration::from_secs(10)),
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
     );
     let second = spawn(
-        Command::new("sleep")
+        Command::new("/bin/sleep")
             .arg("0.3")
-            .timeout(Duration::from_secs(10)),
+            .deadline(Duration::from_secs(2))
+            .must("deadline is valid"),
     );
-
     let (first, second, ()) = tokio::join!(first, second, probe);
-    first.expect("first concurrent sleep must succeed");
-    second.expect("second concurrent sleep must succeed");
+    first.must("first concurrent supervisor exits");
+    second.must("second concurrent supervisor exits");
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_pid(path: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(pid) = support::read_complete_pid(path).must("pid is numeric") {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "child never became ready");
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_until_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let proc_path = format!("/proc/{pid}");
+    while std::path::Path::new(&proc_path).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {pid} survived cleanup"
+        );
+        tokio::task::yield_now().await;
+    }
 }

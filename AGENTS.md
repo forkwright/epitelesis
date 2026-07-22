@@ -1,68 +1,74 @@
 <!--
-scope: epitelesis repo  -  agent onboarding and dispatch conventions
-defers_to: CLAUDE.md for full coding conventions; README.md for the public surface
-tightens: per-crate AGENTS.md files (when added) can narrow conventions within the crate
+scope: epitelesis repository agent conventions
+defers_to: CLAUDE.md for implementation conventions; ARCHITECTURE.md for the public contract
+tightens: nested AGENTS.md files may narrow rules within their directory
 -->
 
 # AGENTS.md
 
 ## Purpose
 
-Epitelesis is the project-wide command-execution wrapper substrate for the
-forkwright fleet. Agents working here add or fix the wrapper surface
-(builder, runners, error variants, tracing), keep the typed-error contract
-honest, and maintain the docs/test set. The primary consumers are
-kanon's `pragma`, `archeion`, `basanos`, `angelos`, `kanon`, `mnemosyne`,
-and `stoa` crates; future fleet consumers add to the list.
+Epitelesis is the typed subprocess lifecycle substrate. Work here must keep
+execution policy explicit, supervisor ownership singular, errors/evidence
+typed, and sync/async semantics aligned.
 
-## Crate
+## Fixed v1 invariants
 
-| Crate | Role |
-|-------|------|
-| `epitelesis` | Command builder + sync runners (`run`, `output`, `status`, `spawn_child`) + optional async runner (`spawn`, feature = `async`) + typed `Error` / `Output`. |
+- `Command` typestate requires a bounded deadline or an unbounded choice with a
+  reason before execution.
+- Environment defaults to real `Clean`/`env_clear`; `Allowlist` is selective;
+  `InheritAll` requires a reason.
+- Capture defaults to 10 MiB independently for stdout and stderr and fails
+  closed at the limit. Truncation and exceptional unbounded capture are
+  explicit policies; managed streaming requires the fallible structural
+  `streaming()` transition, which rejects non-default capture policies.
+- One supervisor owns process-group termination before reap, bounded capture
+  cleanup, and aggregate evidence.
+- `ManagedChild` retains deadline, cancellation, and reap ownership while the
+  caller owns streaming bytes and backpressure.
+- Unsupported backends, including Unix targets without rustix `waitid`, return
+  a typed result before spawn.
+- Unix process groups are cleanup containment, not a security sandbox; a
+  hostile child can escape with `setsid`.
 
-## Build notes
+## Release truth
 
+The workspace version, local `epitelesis` version in `Cargo.lock`, release
+manifest, README dependency marker, and `_llm/current_state.toml` marker are
+one release fact. Run:
+
+```bash
+python3 scripts/verify_release_truth.py
+python3 -m unittest discover -s scripts/tests -v
 ```
-cargo check --workspace --all-features
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace --all-features
-```
 
-The async test path (`tests/spawn_async.rs`) requires the `async` feature.
-The sync tests (`tests/run.rs`) run with default features.
+Ordinary changes require the matching local release tag. Only the dedicated PR
+workflow may select prospective mode, and only for a trusted Release Please PR
+whose five release files changed together from the explicit base commit. Do not
+duplicate release versions outside the marked lines.
 
 ## Gate
 
-Before opening a PR, the gate must pass locally. Branch protection requires a
-`Gate-Passed:` trailer on at least one commit in the PR:
+The full local gate is:
 
-```
-Gate-Passed: kanon <version>
-```
-
-Run `kanon gate .` locally; the command prints the trailer to use. Docs-only
-or workflow-only diffs may use a descriptive inline attestation (e.g.
-`Gate-Passed: docs-only; no Rust changes`). Never fabricate the trailer.
-
-## Commit convention
-
-```
-<type>(<scope>): <description in present tense imperative>
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --all-features
+cargo test --workspace --all-features --doc
 ```
 
-Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `ci`, `perf`.
-Scope is `epitelesis` or `repo` for root-level changes. First line ≤ 72 chars.
-Branch from `main`; one PR per focused change; squash-merge only.
+Branch protection consumes the exact `gate / gate-attestation` context. The PR
+caller and local reusable preserve that name. The local reusable permits only
+the enumerated documentation-only exemption and otherwise runs the full gate on
+GitHub-hosted infrastructure.
 
-## Key invariants
+## Change discipline
 
-- **No direct `std::process::Command` outside this substrate.** That is the
-  rule consumers fail when they bypass us. Don't add wrappers-of-wrappers.
-- **Public surface is typed.** Builder methods, `Output`, and `Error` are the
-  contract. Add variants behind `#[non_exhaustive]`; never remove.
-- **`async` is additive.** Default builds must not pull tokio. Anything that
-  needs tokio lives under the `async` feature gate.
-- **Tests target portable POSIX commands.** `true`, `false`, `printenv`,
-  `head`, `sleep` — anything available on the CI image and the menos
-  workstation. Don't add tests that need a non-standard binary.
+Preserve unrelated worktree changes. Keep typed public errors non-exhaustive.
+The `async` feature is additive and must not add Tokio to default builds. Tests
+must use commands available on the supported CI and development platforms.
+
+Commits use `<type>(<scope>): <imperative description>`, with `epitelesis` or
+`repo` as the scope and a subject no longer than 72 characters.

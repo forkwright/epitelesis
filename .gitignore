@@ -5,6 +5,9 @@ Cargo.lock.bak
 *.swp
 target/
 *.bak
+__pycache__/
+*.py[cod]
+*$py.class
 
 # kanon substrate database — created by `kanon gate` / `kanon lint` runs
 # (fjall on-disk KV cache). Should never be committed; the journal alone

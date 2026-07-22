@@ -23,6 +23,19 @@
                     "type": "toml",
                     "path": "Cargo.toml",
                     "jsonpath": "$.workspace.package.version"
+                },
+                {
+                    "type": "toml",
+                    "path": "Cargo.lock",
+                    "jsonpath": "$.package[?(@.name=='epitelesis' && !@.source)].version"
+                },
+                {
+                    "type": "generic",
+                    "path": "README.md"
+                },
+                {
+                    "type": "generic",
+                    "path": "_llm/current_state.toml"
                 }
             ]
         }

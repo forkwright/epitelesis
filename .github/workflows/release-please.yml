@@ -11,14 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-# WHY: explicit grant of exactly what the shared workflow needs — release
-# PR management, tag/release creation, and source-provenance attestation.
+# WHY: explicit grant of exactly what the shared workflow needs for release
+# PR management and tag/release creation.
 permissions:
-  attestations: write
   contents: write
-  id-token: write
   pull-requests: write
 
 jobs:
   call:
-    uses: forkwright/.github/.github/workflows/release-please.yml@main
+    uses: forkwright/.github/.github/workflows/release-please.yml@dca8a29deedb6d665fd12ad4121f6e68988cad91

@@ -1,84 +1,101 @@
 # epitelesis
 
-*ἐπιτέλεσις  -  the process of executing-to-completion.*
+*ἐπιτέλεσις — the process of executing-to-completion.*
 
-The project-wide command-execution wrapper substrate for the forkwright fleet.
-Every production subprocess invocation goes through one place: argument
-assembly, environment and working-directory passthrough, timeout enforcement,
-stdout/stderr capture, structured errors, and tracing spans live here so
-consumers stop reinventing them per call site.
+Epitelesis is a typed subprocess lifecycle boundary. It makes execution policy
+explicit before a command can run and returns structured evidence after the
+supervisor has finished cleanup.
 
-## Why
+## Supported release
 
-Direct `std::process::Command` use is forbidden in fleet code by the
-[`RUST/no-direct-process-command`](https://github.com/forkwright/kanon/blob/main/crates/basanos/standards/RUST.md#command-execution)
-rule. Raw `Command` invites forgotten timeout configuration, missed exit-code
-handling, dropped argument quoting, and ad-hoc error types callers cannot match
-on. Epitelesis centralises those concerns behind a single typed surface.
-
-## Quickstart
+The dependency pin below is the supported release. Release Please updates this
+line as a generic extra file; keep its marker and its single version token on
+the same line.
 
 ```toml
 [dependencies]
-epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.1.0" }
+epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.2.0" } # x-release-please-version
 ```
 
-```rust
-use epitelesis::{Command, run};
-use std::time::Duration;
+The remaining sections define the fixed breaking contract for v1. They do not
+claim that the currently tagged release already exposes that surface.
 
-let output = run(
-    Command::new("git")
-        .arg("status")
-        .arg("--porcelain")
-        .timeout(Duration::from_secs(5)),
-)?;
-assert!(output.success());
-# Ok::<(), epitelesis::Error>(())
-```
+## Invocation contract (v1)
 
-## Surface
+`Command` uses typestate: an invocation is not runnable until the caller picks
+one deadline policy:
 
-| Item | Role |
-|---|---|
-| `Command` | Builder capturing program, args, env, cwd, timeout, stdio. |
-| `run` | Synchronous executor returning `Output` (success) or typed `Error`. |
-| `output` | Synchronous captured-output helper preserving non-zero output. |
-| `status` | Synchronous status helper preserving non-zero status. |
-| `spawn_child` | Synchronous child-handle helper for streaming callers. |
-| `spawn` | Asynchronous executor (gated by the `async` Cargo feature). |
-| `Output` | Captured status, stdout, stderr, and elapsed duration. |
-| `Error` | Typed error variants (snafu, `#[non_exhaustive]`). |
+- a bounded deadline; or
+- explicitly unbounded execution with a reason.
+
+Environment policy is also explicit and fail-closed:
+
+- `Clean` is the default and applies real `env_clear` semantics;
+- `Allowlist` exposes only named variables; and
+- `InheritAll` requires a reason.
+
+Captured stdout and stderr each default to a 10 MiB limit. Crossing either
+limit fails closed. A caller may instead choose explicit truncation or
+exceptional unbounded capture; unbounded capture requires justification.
+Managed streaming is a different structural state created with the fallible
+`command.streaming()?` transition. It rejects non-default capture policies so
+non-default capture behavior cannot be silently discarded.
+
+## Lifecycle ownership
+
+One supervisor owns the invocation from spawn through final evidence. On Unix,
+it creates and supervises a process group, pumps both capture pipes in one
+fair nonblocking `poll` loop, kills the group before reaping, and performs
+bounded cleanup. There are no capture reader threads. The caller-visible
+cleanup allowance is 2.1 seconds. If the leader remains unsettled, the
+supervisor attempts to transfer ownership to a deliberately named background
+reaper; typed reap disposition, failures, and cleanup evidence report the
+outcome. That fallback endpoint is established fallibly before process
+creation, so its startup cannot strand a running child.
+
+`ManagedChild` retains ownership of deadline handling, cancellation, and reap
+for caller-managed execution. Construct it only from `Command<Ready>` via
+`.streaming()?.spawn()` (or `spawn_managed(command.streaming()?)`). The caller
+owns bytes and backpressure after taking a pipe handle. `wait` closes retained
+stdin first, `poll` distinguishes running, successful, and failed terminal
+states without blocking, and `cancel` returns aggregate evidence only after
+complete cancellation cleanup. Drop requests cancellation without blocking;
+the detached supervisor retains lifecycle ownership through bounded cleanup
+and any required background-reaper handoff.
+
+Platforms without the required process-group lifecycle return a typed
+unsupported error before spawn. This includes non-Unix platforms and Unix
+targets where rustix does not provide `waitid` (`cygwin`, `horizon`, `openbsd`,
+`redox`, and `wasi`). Process groups are containment for ordinary descendant
+cleanup, not a security sandbox: a hostile child can call `setsid` and escape.
+
+## Evidence model
+
+Every post-spawn terminal path owns one boxed `LifecycleEvidence`: optional
+leader status, recoverable elapsed time, typed process-group signal and leader
+reap outcomes, deterministic stdout/stderr reports, and a typed cleanup
+outcome. Only EOF produces `Complete` or `Truncated`; read failures and cleanup
+snapshots are `Incomplete`, while an unrecoverable adapter result is `Unknown`.
+Timeout errors retain both their configured deadline and known actual elapsed
+time. Callers decide how to render or redact bytes; Epitelesis does not trust
+them.
+
+Release truth has five synchronized files: `Cargo.toml`, the local
+`epitelesis` package in `Cargo.lock`, `.release-please-manifest.json`, the README
+dependency marker, and `_llm/current_state.toml`. The protected
+`gate / gate-attestation` context verifies them before allowing either the
+exact prose-only exemption or a successful hosted Rust build.
 
 ## Cargo features
 
-| Feature | What it enables |
-|---|---|
-| (default) | Sync `run` / `output` / `status` / `spawn_child` over `std::process::Command`. |
-| `async` | Adds `epitelesis::spawn` over `tokio::process::Command` and pulls tokio. |
+The default build is synchronous. The additive `async` feature enables the
+asynchronous runner without making Tokio a default dependency. Sync and async
+entry points share the same invocation policies and supervisor invariants.
 
-## Errors
+## Non-goals
 
-The error surface is typed and `#[non_exhaustive]`, so consumers match on
-variant without losing the underlying `io::Error` chain:
-
-- `Error::SpawnFailed`  -  kernel refused to spawn the child (program not on
-  `PATH`, permission denied, fork failure).
-- `Error::NonZeroExit`  -  child spawned and exited with a non-zero status.
-  Carries the captured `Output` payload so callers retain access to
-  `stdout`/`stderr`/`status` even on failure.
-- `Error::Timeout`  -  configured `Command::timeout` elapsed; the runner has
-  already killed and reaped the child by the time this error returns.
-  Carries the partial `stdout`/`stderr` captured before the deadline.
-- `Error::Io`  -  IO failure while waiting on the child or capturing output.
-
-## Consumers
-
-Today, every crate of [forkwright/kanon](https://github.com/forkwright/kanon)
-(the fleet's standards and dispatch toolkit) that spawns a subprocess:
-`pragma`, `archeion`, `basanos`, `angelos`, `kanon`, `mnemosyne`, `stoa`.
-Future fleet consumers take a hard dependency on this crate instead of
-reinventing the wrapper.
+Epitelesis does not provide command discovery, retry policy, shell parsing,
+argument validation, credential redaction, or a security sandbox.
 
 ## License
 

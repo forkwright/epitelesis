@@ -12,8 +12,8 @@ readme = "../../README.md"
 
 [features]
 default = []
-# WHY: gates `epitelesis::spawn` (tokio::process::Command) so consumers that
-# only need the sync `run` path don't pull tokio.
+# WHY: gates the Tokio adapter so consumers that only need synchronous
+# execution do not pull an async runtime.
 async = ["dep:tokio"]
 
 [dependencies]
@@ -22,6 +22,12 @@ tracing = { workspace = true }
 # WHY: tokio is gated behind the `async` feature so default builds stay
 # sync-only and don't pay the runtime cost or dep weight when unused.
 tokio = { workspace = true, optional = true }
+
+[target.'cfg(all(unix, not(any(target_os = "cygwin", target_os = "horizon", target_os = "openbsd", target_os = "redox", target_os = "wasi"))))'.dependencies]
+# WHY: process supplies waitid/process-group signaling, event supplies poll,
+# and fs supplies safe fcntl nonblocking setup. Unsupported waitid targets do
+# not acquire rustix and return a typed capability error before spawn.
+rustix = { version = "1.1", default-features = false, features = ["event", "fs", "process", "std"] }
 
 [dev-dependencies]
 # WHY: tempfile-backed scratch directories let cwd/env tests exercise real
@@ -48,4 +54,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 [package.metadata.kanon]
 maturity = "alpha"
 since = "2026-05-28"
-exit-criteria = "kanon and ≥1 other fleet repo consume v0.1.x at a pinned tag; release-please cuts v0.2.0 marking surface freeze"
+exit-criteria = "the hosted protected gate proves the public v1 contract and all five aligned provider release facts"

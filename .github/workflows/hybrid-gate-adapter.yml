@@ -1,0 +1,187 @@
+name: Hosted Gate Adapter
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    name: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      code_affecting: ${{ steps.classify.outputs.code_affecting }}
+    steps:
+      - name: Check out the exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release truth before classification
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_LOGIN: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -v
+          if [[ "$HEAD_REPOSITORY" == "$REPOSITORY" ]] \
+            && [[ "$HEAD_REF" == release-please--branches--* ]] \
+            && [[ "$HEAD_LOGIN" == "github-actions[bot]" || "$HEAD_LOGIN" == "release-please[bot]" ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_release_truth.py \
+              --prospective --base "$BASE_SHA"
+          else
+            PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_release_truth.py
+          fi
+
+      - name: Classify the exact prose-only exemption
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git diff --name-status --find-renames -z \
+            "$BASE_SHA" "$HEAD_SHA" > "${RUNNER_TEMP}/changed-status.z"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          allowed = {
+              "AGENTS.md",
+              "ARCHITECTURE.md",
+              "CHANGELOG.md",
+              "CLAUDE.md",
+              "README.md",
+              "SECURITY.md",
+              "llms.txt",
+          }
+          tokens = Path(os.environ["RUNNER_TEMP"]).joinpath("changed-status.z").read_bytes().split(b"\0")
+          if tokens and tokens[-1] == b"":
+              tokens.pop()
+          paths = []
+          renamed = False
+          index = 0
+          while index < len(tokens):
+              status = tokens[index].decode("ascii", "strict")
+              index += 1
+              count = 2 if status.startswith(("R", "C")) else 1
+              if index + count > len(tokens):
+                  raise SystemExit("malformed NUL-delimited git diff")
+              decoded = [token.decode("utf-8", "surrogateescape") for token in tokens[index:index + count]]
+              index += count
+              paths.extend(decoded)
+              renamed |= count == 2
+          docs_only = bool(paths) and not renamed and all(path in allowed for path in paths)
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"docs_only={str(docs_only).lower()}\n")
+              handle.write(f"code_affecting={str(not docs_only).lower()}\n")
+          Path("changed-files.txt").write_text(
+              "".join(f"{path!r}\n" for path in paths), encoding="utf-8"
+          )
+          PY
+          sed 's/^/  /' changed-files.txt
+
+  full-gate-build:
+    name: full-gate-build
+    needs: policy
+    if: ${{ needs.policy.outputs.code_affecting == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: always
+      RUST_TEST_THREADS: 2
+    steps:
+      - name: Check out the exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install the declared Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: 1.94.0
+          components: rustfmt, clippy
+
+      - name: Restore Cargo caches
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: epitelesis-gate
+          cache-all-crates: true
+
+      - name: Install pinned cargo-nextest
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: nextest@0.9.140
+
+      - name: Run the complete Rust gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          cargo fmt --all -- --check 2>&1 | tee ci-logs/fmt.log
+          cargo check --locked --workspace --all-targets --all-features \
+            2>&1 | tee ci-logs/check.log
+          cargo clippy --locked --workspace --all-targets --all-features -- \
+            -D warnings 2>&1 | tee ci-logs/clippy.log
+          cargo nextest run --locked --workspace --all-features --test-threads 2 \
+            2>&1 | tee ci-logs/nextest.log
+          cargo test --locked --workspace --all-features --doc \
+            2>&1 | tee ci-logs/doctest.log
+
+      - name: Upload failure evidence
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-failure-${{ github.event.pull_request.head.sha }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+  gate-attestation:
+    name: gate-attestation
+    if: ${{ always() }}
+    needs: [policy, full-gate-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Accept only a proved exemption or successful hosted build
+        shell: bash
+        env:
+          POLICY_RESULT: ${{ needs.policy.result }}
+          DOCS_ONLY: ${{ needs.policy.outputs.docs_only }}
+          CODE_AFFECTING: ${{ needs.policy.outputs.code_affecting }}
+          BUILD_RESULT: ${{ needs.full-gate-build.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$POLICY_RESULT" != "success" ]]; then
+            echo "policy did not succeed"
+            exit 1
+          fi
+          if [[ "$DOCS_ONLY" == "true" && "$CODE_AFFECTING" == "false" && "$BUILD_RESULT" == "skipped" ]]; then
+            exit 0
+          fi
+          if [[ "$DOCS_ONLY" == "false" && "$CODE_AFFECTING" == "true" && "$BUILD_RESULT" == "success" ]]; then
+            exit 0
+          fi
+          echo "invalid policy/build result combination"
+          exit 1
