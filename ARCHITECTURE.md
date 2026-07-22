@@ -1,46 +1,83 @@
 # Architecture
 
-Epitelesis owns an invocation from policy declaration through process-group
-settlement and leader reap. Public sync, Tokio, and managed-streaming surfaces
-are thin adapters over one private supervisor state machine.
+Epitelesis is a typed boundary around one subprocess invocation. Configuration
+becomes an executable command only after mandatory policy choices are present;
+one supervisor then owns the process and all evidence until cleanup completes.
 
-## Layers
+## Control flow
 
+```text
+Command typestate
+  ├─ deadline: bounded | unbounded(reason)
+  ├─ environment: Clean | Allowlist | InheritAll(reason)
+  └─ capture: bounded(10 MiB/stream, fail-closed)
+              | truncate | stream | unbounded(exceptional reason)
+                         │
+                         ▼
+                    supervisor
+              spawn → observe → terminate → reap
+                         │
+                         ▼
+                  aggregated evidence
 ```
-Command<Draft>
-    │ deadline(duration) / unbounded(reason)
-    ▼
-Command<Ready> ── validate env/PATH/backend before spawn
-    ▼
-Unix owned process group + armed child guard
-    ▼
-serialized exit / deadline / limit / cancellation outcome
-    ▼
-signal group → observe leader exit without reap → reap → settle capture
-```
 
-Non-Unix backends return `UnsupportedCapability(OwnedProcessGroup)` before
-spawn. They do not silently degrade to direct-child ownership. A future Windows
-implementation must use a Job Object.
+The typestate boundary prevents execution before a bounded deadline or an
+explicit reason-bearing unbounded deadline has been selected. `Clean` is the
+environment default and invokes real environment clearing. Environment
+inheritance and unbounded resource use are visible exceptions, not implicit
+fallbacks.
 
-## Modules
+## Supervisor invariant
 
-| Module | Role |
-|---|---|
-| `policy` | Typestate markers and explicit lifetime, environment, and capture policies. |
-| `command` | Non-clone builder, pre-spawn validation, `env_clear` translation, and Unix process-group configuration. |
-| `supervisor` | Private event-driven state machine, bounded capture workers, safe rustix signaling/wait observation, and armed lifecycle guard. |
-| `managed` | Restricted streaming handle backed by a background supervisor. |
-| `sync` | `run`, `output`, and `status` adapters. |
-| `async_impl` | Tokio `spawn` adapter with future-drop cancellation. |
-| `output` | Captured prefixes plus complete/truncated/redirected evidence. |
-| `error` | Primary typed outcomes and retained secondary cleanup evidence. |
+Exactly one supervisor owns each running invocation. It owns:
 
-## Containment boundary
+- process creation and observation;
+- deadline and cancellation decisions;
+- stdout and stderr capture under the selected limits;
+- termination of the Unix process group before reap;
+- bounded drain and capture cleanup; and
+- construction of a single evidence-bearing result.
 
-`process_group(0)` contains the leader and ordinary descendants. It is not a
-hostile-child sandbox: a descendant can call `setsid` and escape. If an escaped
-process retains a capture pipe past the shared cleanup deadline, the supervisor
-returns `CleanupIncomplete` with exact unfinished streams and may leave only
-those reader threads alive. Ordinary in-group descendants are signaled and all
-capture workers settle before return.
+Cleanup is part of the result, not best-effort work after it. If termination,
+reap, or capture cleanup also fails, that evidence is aggregated so the first
+failure does not erase later lifecycle facts.
+
+`ManagedChild` is the supervised handoff for caller-managed operation. It keeps
+deadline, cancellation, and reap ownership together; it is not a detached raw
+child handle.
+
+## Portability boundary
+
+The full lifecycle contract relies on Unix process groups. Unsupported
+platforms return a typed unsupported result instead of silently weakening kill
+or reap behavior.
+
+Killing a process group is operational containment, not adversarial isolation.
+A hostile descendant can call `setsid`, leave the group, and outlive group
+termination. Callers needing a security boundary must use an operating-system
+sandbox or container designed for that purpose.
+
+## Capture bounds
+
+The default maximum is 10 MiB independently for stdout and stderr. Crossing a
+limit fails closed. Truncation and streaming must be chosen explicitly.
+Exceptional unbounded capture requires a reason and remains the caller's memory
+risk. Capture cleanup itself is bounded so a pipe that never closes cannot make
+the supervisor wait forever after termination.
+
+## Public contract
+
+The SemVer surface includes typestate transitions, execution entry points,
+environment and capture policy types, `ManagedChild`, output/evidence types,
+typed errors, and Cargo features. Error enums remain non-exhaustive so new
+evidence can be added without encouraging exhaustive downstream matches.
+
+The synchronous default and additive `async` feature must implement the same
+policy and lifecycle semantics. Async support may add runtime dependencies only
+when that feature is enabled.
+
+## Consumer boundary
+
+Callers own program selection, argument validation, retry policy, redaction,
+and any actual sandbox. Epitelesis owns subprocess policy enforcement,
+lifecycle completion, and the evidence returned from that lifecycle.

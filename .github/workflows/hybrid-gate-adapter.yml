@@ -1,0 +1,35 @@
+name: Hybrid Gate Adapter
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  hybrid-gate:
+    uses: forkwright/.github/.github/workflows/hybrid-gate.yml@dca8a29deedb6d665fd12ad4121f6e68988cad91
+    with:
+      fmt_cmd: cargo fmt --all -- --check
+      check_cmd: cargo check --workspace --all-targets --all-features
+      clippy_cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      nextest_cmd: cargo nextest run --workspace --all-features
+      doctest_cmd: cargo test --workspace --all-features --doc
+      needs_fleet_repo_token: false
+
+  gate-attestation:
+    needs: hybrid-gate
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the nested gate to pass
+        env:
+          NESTED_RESULT: ${{ needs.hybrid-gate.result }}
+        run: |
+          if [ "$NESTED_RESULT" != "success" ]; then
+            echo "Nested hybrid gate result was $NESTED_RESULT; expected success." >&2
+            exit 1
+          fi
+          echo "Nested hybrid gate passed."

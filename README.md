@@ -2,60 +2,75 @@
 
 *ἐπιτέλεσις — the process of executing-to-completion.*
 
-Epitelesis is the forkwright fleet's structurally safe subprocess substrate.
-It makes lifetime, environment, capture bounds, process-group ownership, and
-cleanup evidence part of the API rather than caller convention.
+Epitelesis is a typed subprocess lifecycle boundary. It makes execution policy
+explicit before a command can run and returns structured evidence after the
+supervisor has finished cleanup.
 
-## Quickstart
+## Supported release
 
-```rust
-use epitelesis::{Command, run};
-use std::time::Duration;
+The dependency pin below is the supported release. Release Please updates this
+line as a generic extra file; keep its marker and its single version token on
+the same line.
 
-let output = run(
-    Command::new("/usr/bin/git")
-        .arg("status")
-        .arg("--porcelain")
-        .deadline(Duration::from_secs(5))?,
-)?;
-# Ok::<(), epitelesis::Error>(())
+```toml
+[dependencies]
+epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.2.0" } # x-release-please-version
 ```
 
-`Command::new` returns `Command<Draft>`, which no runner accepts. A validated
-`.deadline(...)` or `.unbounded(non_empty_reason)` produces `Command<Ready>`.
-Deadline overflow is an `InvalidPolicy` error before spawn.
+The remaining sections define the fixed breaking contract for v1. They do not
+claim that the currently tagged release already exposes that surface.
 
-## Safety defaults
+## Invocation contract (v1)
 
-- The child environment begins with `env_clear`; choose Clean (default), an
-  allowlist, or full inheritance with a non-empty reason. Explicit set/remove
-  operations apply afterward. Bare names require an explicitly available PATH.
-- Stdout and stderr independently fail closed at 10 MiB by default. Callers may
-  choose a smaller/larger bound, bounded truncate-and-drain, or exceptional
-  unbounded capture with a reason.
-- Output distinguishes complete empty capture from redirection and records
-  exact discarded-byte counts for truncation.
-- On Unix, every child leads an owned process group. Timeout, capture limit,
-  cancellation, async-future drop, and managed-handle drop signal the group,
-  observe leader exit without reaping, then reap and settle capture.
-- Non-Unix platforms return `UnsupportedCapability(OwnedProcessGroup)` before
-  spawn until a Job Object backend exists.
+`Command` uses typestate: an invocation is not runnable until the caller picks
+one deadline policy:
 
-## Public surface
+- a bounded deadline; or
+- explicitly unbounded execution with a reason.
 
-| Item | Role |
-|---|---|
-| `Command<Draft/Ready>` | Typestate invocation builder. |
-| `run`, `output`, `status` | Synchronous adapters over the shared supervisor. |
-| `spawn` | Tokio adapter behind the `async` feature. |
-| `spawn_managed`, `ManagedChild` | Streaming handle with background enforcement and no raw escape. |
-| `CapturePolicy`, `EnvironmentPolicy` | Explicit capture and environment choices. |
-| `Output`, `CapturedStream` | Sole owned status/buffers plus completeness evidence. |
-| `Error` | Primary outcome with typed secondary signal/reap/capture/cleanup evidence. |
+Environment policy is also explicit and fail-closed:
 
-Process groups contain ordinary descendants; they are not a hostile-child
-sandbox. A child that calls `setsid` can escape, and an escaped pipe owner is
-reported truthfully as `CleanupIncomplete` after bounded cleanup.
+- `Clean` is the default and applies real `env_clear` semantics;
+- `Allowlist` exposes only named variables; and
+- `InheritAll` requires a reason.
+
+Captured stdout and stderr each default to a 10 MiB limit. Reaching either
+limit fails closed. A caller may instead choose explicit truncation, streaming,
+or exceptional unbounded capture; unbounded capture requires justification.
+
+## Lifecycle ownership
+
+One supervisor owns the invocation from spawn through final evidence. On Unix,
+it creates and supervises a process group, kills the group before reaping,
+performs bounded capture cleanup, and aggregates exit, termination, and capture
+evidence rather than losing later failures behind the first one.
+
+`ManagedChild` retains ownership of deadline handling, cancellation, and reap
+for caller-managed execution. Returning or dropping a handle must not silently
+detach those obligations.
+
+Platforms without the required process-group lifecycle return a typed
+unsupported error. Process groups are containment for ordinary descendant
+cleanup, not a security sandbox: a hostile child can call `setsid` and escape
+the group.
+
+## Evidence model
+
+Success and failure are typed outcomes. Evidence includes the observed exit or
+termination state, capture results governed by the selected policy, elapsed
+time, and any cleanup failures. Callers decide how to render or redact bytes;
+Epitelesis transports evidence and does not treat captured output as trusted.
+
+## Cargo features
+
+The default build is synchronous. The additive `async` feature enables the
+asynchronous runner without making Tokio a default dependency. Sync and async
+entry points share the same invocation policies and supervisor invariants.
+
+## Non-goals
+
+Epitelesis does not provide command discovery, retry policy, shell parsing,
+argument validation, credential redaction, or a security sandbox.
 
 ## License
 

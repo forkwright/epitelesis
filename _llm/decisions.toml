@@ -5,39 +5,57 @@ generated = false
 source_docs = [
   "README.md",
   "ARCHITECTURE.md",
+  "SECURITY.md",
+  "release-please-config.json",
 ]
 
 [decisions]
-summary = "Core decisions for the fleet command-execution substrate."
+summary = "Accepted design and release decisions for the subprocess lifecycle substrate."
 
 [[decision]]
-id = "D-extract-from-kanon"
-title = "Extract epitelesis from kanon to its own fleet repo"
+id = "D-policy-complete-typestate"
+title = "Require execution policy before a command is runnable"
 status = "accepted"
-context = "kanon planning D-067 (Tier B EXTRACT-NOW): the crate is fleet substrate by self-description ('project-wide command-execution wrapper substrate for the forkwright fleet'). Multiple kanon crates already depend on it; future cross-fleet consumers would too."
-decision = "Ship epitelesis from forkwright/epitelesis as a workspace with one crate at crates/epitelesis/. Consumers pin a git tag at the workspace level."
-consequences = "kanon consumes epitelesis as a workspace git dep. The basanos RUST/no-direct-process-command rule loses its in-tree path exemption for crates/epitelesis/ — the crate is external; the lint exemption goes away as dead code."
+context = "Implicit time, environment, and memory policies make subprocess safety depend on call-site discipline."
+decision = "Command typestate requires a bounded deadline or reason-bearing unbounded execution. Clean/env_clear is the environment default; Allowlist is selective; InheritAll requires a reason. Capture defaults to 10 MiB per stream and fails closed, with explicit truncation, streaming, and exceptional reason-bearing unbounded alternatives."
+consequences = "Risk-bearing choices are visible in construction and cannot be omitted accidentally."
 
 [[decision]]
-id = "D-workspace-shape"
-title = "Workspace with one crate, room for siblings"
+id = "D-single-supervisor"
+title = "Give one supervisor the whole subprocess lifecycle"
 status = "accepted"
-context = "epitelesis today is a single crate, but plausible future helpers (epitelesis-cli for ad-hoc subprocess smoke tests, an epitelesis-test-helpers crate for fixtures) want to live in the same repo."
-decision = "Use a workspace at the repo root with the production crate at crates/epitelesis/. Release-please uses release-type 'simple' with extra-files bumping the workspace version."
-consequences = "Adding a sibling crate later is a Cargo.toml members edit, not a repo restructure."
+context = "Splitting timeout, cancellation, capture, kill, and reap ownership loses cleanup failures and can leak descendants."
+decision = "One supervisor owns spawn through final evidence. On Unix it kills the process group before reap, performs bounded capture cleanup, and aggregates lifecycle evidence. ManagedChild retains deadline, cancellation, and reap ownership."
+consequences = "Results describe cleanup as well as the first observed failure; caller-managed execution cannot silently detach lifecycle obligations."
+
+[[decision]]
+id = "D-portability-boundary"
+title = "Type unsupported lifecycle behavior"
+status = "accepted"
+context = "The required descendant cleanup semantics depend on Unix process groups."
+decision = "Platforms that cannot provide the required lifecycle return typed unsupported results. Process groups are documented as operational containment, not a security sandbox, because hostile children can call setsid."
+consequences = "Portability does not silently weaken termination guarantees, and callers must choose a real sandbox for hostile code."
+
+[[decision]]
+id = "D-async-additive"
+title = "Keep async execution additive"
+status = "accepted"
+context = "Synchronous callers should not acquire an async runtime dependency."
+decision = "The default build is synchronous. The async runner stays behind the async feature and implements the same policy and supervisor semantics."
+consequences = "Sync-only dependency cost stays small while lifecycle behavior remains consistent."
+
+[[decision]]
+id = "D-release-truth"
+title = "Verify one atomic release fact"
+status = "accepted"
+context = "Workspace, manifest, human documentation, and machine state can drift, while an untagged prospective release is valid only inside trusted release automation."
+decision = "Align four release files. README and machine state use same-line generic Release Please markers. Ordinary verification requires the named local tag. Prospective verification requires a trusted bot PR, an explicit base, and all four files changed together."
+consequences = "Normal PRs cannot advertise an untagged release, while a complete Release Please bump can pass before its tag exists."
 
 [[decision]]
 id = "D-dual-license"
 title = "Dual-license Apache-2.0 OR MIT"
 status = "accepted"
-context = "epitelesis is fleet substrate intended for cross-fleet consumption. theatron (the worked-example fleet repo) uses Apache-2.0 OR MIT for the same reason: ecosystem norm + permissive consumer reuse."
-decision = "Apache-2.0 OR MIT, with LICENSE-APACHE / LICENSE-MIT / LICENSE at repo root following theatron."
-consequences = "Consumers inside and outside the forkwright fleet take a single dep without contagious licensing."
-
-[[decision]]
-id = "D-async-as-feature"
-title = "Async runner is an additive Cargo feature"
-status = "accepted"
-context = "Inherited from kanon's crate. Most consumers only need the sync run path; pulling tokio in by default would tax sync-only consumers with a heavyweight dep."
-decision = "Keep `epitelesis::spawn` gated by `feature = 'async'`. Default builds stay sync-only and do not depend on tokio."
-consequences = "Async consumers opt in via feature flag and pay for what they use. Sync consumers stay lean."
+context = "The library is reusable subprocess infrastructure."
+decision = "Distribute Epitelesis under Apache-2.0 OR MIT."
+consequences = "Consumers may select either permissive license."

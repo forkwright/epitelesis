@@ -1,23 +1,22 @@
 # epitelesis
 
-> ἐπιτέλεσις — the process of executing-to-completion. Fleet-wide command-execution wrapper substrate.
+> Typed subprocess policy, lifecycle supervision, and aggregate execution evidence.
 
-## Library
+## Canonical documents
 
-The public surface is the single Rust crate under `crates/epitelesis/`. See
-the crate-root rustdoc and [README.md](README.md) for the API summary.
+- [README.md](README.md): supported dependency pin and fixed v1 contract
+- [ARCHITECTURE.md](ARCHITECTURE.md): typestate, supervisor, portability, and evidence model
+- [SECURITY.md](SECURITY.md): trust boundary and process-group limitation
+- [AGENTS.md](AGENTS.md): repository workflow and release-truth checks
+- [CLAUDE.md](CLAUDE.md): implementation invariants
 
-## Architecture
+## Machine-readable state
 
-Structured LLM corpus:
-- [_llm/architecture.toml](_llm/architecture.toml): crate role and module layout
-- [_llm/current_state.toml](_llm/current_state.toml): current phase and consumers
-- [_llm/decisions.toml](_llm/decisions.toml): accepted decisions
+- [_llm/architecture.toml](_llm/architecture.toml): components and lifecycle invariants
+- [_llm/current_state.toml](_llm/current_state.toml): supported release fact and current phase
+- [_llm/decisions.toml](_llm/decisions.toml): accepted design and release decisions
 
-## Agent entry points
+## Verification
 
-- [README.md](README.md): public surface and quickstart
-- [CLAUDE.md](CLAUDE.md): agent conventions
-- [AGENTS.md](AGENTS.md): dispatch conventions
-- [ARCHITECTURE.md](ARCHITECTURE.md): module roles + SemVer contract
-- [SECURITY.md](SECURITY.md): vulnerability reporting policy
+- [scripts/verify_release_truth.py](scripts/verify_release_truth.py): dependency-free release alignment and tag verifier
+- [scripts/tests/test_verify_release_truth.py](scripts/tests/test_verify_release_truth.py): deterministic temporary-repository coverage
