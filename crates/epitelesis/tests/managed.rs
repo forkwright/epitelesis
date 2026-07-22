@@ -209,7 +209,9 @@ fn wait_for_terminal_poll(child: &mut epitelesis::ManagedChild, success: bool) {
 fn wait_for_pid(path: &std::path::Path) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if let Ok(value) = std::fs::read_to_string(path) {
+        if let Ok(value) = std::fs::read_to_string(path)
+            && value.ends_with('\n')
+        {
             return value.trim().parse().must("pid is numeric");
         }
         assert!(Instant::now() < deadline, "child never became ready");
