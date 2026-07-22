@@ -35,16 +35,18 @@ mod sync;
 #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
 mod async_impl;
 
-pub use command::Command;
+pub use command::{Command, StreamingCommand};
 pub use error::{
-    Capability, CaptureReport, CaptureWorkerFailure, CleanupIncompleteEvidence, Error,
-    FailureEvidence, Result, SecondaryErrors,
+    Capability, CaptureFailure, CleanupIncompleteEvidence, Error, FailureEvidence, Result,
 };
-pub use managed::{ManagedChild, spawn_managed};
-pub use output::{CaptureCompleteness, CapturedStream, Output, StreamName};
+pub use managed::{ManagedChild, ManagedPoll, spawn_managed};
+pub use output::{
+    CaptureCompleteness, CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome,
+    LeaderReapDisposition, LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output, StreamName,
+};
 pub use policy::{
-    CapturePolicy, DEFAULT_CAPTURE_LIMIT, Draft, EnvironmentPolicy, ExecutionPolicy,
-    NonEmptyReason, OverflowBehavior, PolicyViolation, Ready,
+    CLEANUP_ALLOWANCE, CapturePolicy, DEFAULT_CAPTURE_LIMIT, Draft, EnvironmentPolicy,
+    ExecutionPolicy, NonEmptyReason, OverflowBehavior, PolicyViolation, Ready,
 };
 pub use sync::{output, run, status};
 

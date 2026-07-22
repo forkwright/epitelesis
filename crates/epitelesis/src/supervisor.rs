@@ -4,8 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Command;
+use crate::command::StreamingCommand;
 use crate::error::Result;
 use crate::policy::Ready;
+
+pub(crate) const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const MANAGED_DROP_BUDGET: std::time::Duration = crate::policy::CLEANUP_ALLOWANCE;
 
 pub(crate) struct ManagedLaunch {
     pub(crate) id: u32,
@@ -13,7 +17,8 @@ pub(crate) struct ManagedLaunch {
     pub(crate) stdout: Option<std::process::ChildStdout>,
     pub(crate) stderr: Option<std::process::ChildStderr>,
     pub(crate) cancel: std::sync::mpsc::Sender<()>,
-    pub(crate) result: std::sync::mpsc::Receiver<Result<std::process::ExitStatus>>,
+    pub(crate) result: std::sync::mpsc::Receiver<Result<crate::output::ManagedOutput>>,
+    pub(crate) supervisor: std::thread::JoinHandle<()>,
 }
 
 /// Cooperative cancellation observed by the serialized supervisor loop.
@@ -21,6 +26,7 @@ pub(crate) struct ManagedLaunch {
 pub(crate) struct Cancellation(Arc<AtomicBool>);
 
 impl Cancellation {
+    #[cfg(feature = "async")]
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
@@ -35,11 +41,29 @@ pub(crate) fn execute(
     cancellation: Cancellation,
 ) -> Result<crate::Output> {
     let prepared = crate::command::prepare(command)?;
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
     {
         unix::execute(prepared, cancellation)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    )))]
     {
         drop((prepared, cancellation));
         crate::error::UnsupportedCapabilitySnafu {
@@ -49,29 +73,31 @@ pub(crate) fn execute(
     }
 }
 
-pub(crate) fn spawn_managed(command: Command<Ready>) -> Result<ManagedLaunch> {
-    if command.stdout_capture.is_unbounded() {
-        return crate::error::InvalidPolicySnafu {
-            violation: crate::policy::PolicyViolation::UnboundedCaptureForManaged(
-                crate::output::StreamName::Stdout,
-            ),
-        }
-        .fail();
-    }
-    if command.stderr_capture.is_unbounded() {
-        return crate::error::InvalidPolicySnafu {
-            violation: crate::policy::PolicyViolation::UnboundedCaptureForManaged(
-                crate::output::StreamName::Stderr,
-            ),
-        }
-        .fail();
-    }
-    let prepared = crate::command::prepare(command)?;
-    #[cfg(unix)]
+pub(crate) fn spawn_managed(command: StreamingCommand) -> Result<ManagedLaunch> {
+    let prepared = crate::command::prepare(command.command)?;
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
     {
         unix::spawn_managed(prepared)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    )))]
     {
         drop(prepared);
         crate::error::UnsupportedCapabilitySnafu {
@@ -81,36 +107,103 @@ pub(crate) fn spawn_managed(command: Command<Ready>) -> Result<ManagedLaunch> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
 mod unix {
     use std::io::Read as _;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::process::{Child, ExitStatus};
+    use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-    use std::sync::{Arc, Mutex, MutexGuard};
-    use std::thread::{self, JoinHandle};
+    use std::thread;
     use std::time::{Duration, Instant};
 
+    use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
-    use snafu::ResultExt as _;
+    use snafu::IntoError as _;
 
-    use super::Cancellation;
+    use super::{CLEANUP_BUDGET, Cancellation, ManagedLaunch};
     use crate::command::PreparedCommand;
     use crate::error::{
-        CancelledSnafu, CaptureFailedSnafu, CaptureLimitExceededSnafu, CaptureReport,
-        CaptureWorkerFailure, CleanupIncompleteEvidence, CleanupIncompleteSnafu, FailureEvidence,
-        NonZeroExitSnafu, Result, SecondaryErrors, SpawnFailedSnafu, SupervisionFailedSnafu,
-        TimeoutSnafu,
+        CancelledSnafu, CaptureFailedSnafu, CaptureFailure, CaptureLimitExceededSnafu,
+        CleanupIncompleteEvidence, CleanupIncompleteSnafu, FailureEvidence, LifecycleFailedSnafu,
+        NonZeroExitSnafu, ReaperStartFailedSnafu, Result, SpawnFailedSnafu, SupervisionFailedSnafu,
+        SupervisorStartFailedSnafu, TimeoutSnafu,
     };
-    use crate::output::{CapturedStream, Output, StreamName};
+    use crate::output::{
+        CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,
+        LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output, StreamName,
+    };
     use crate::policy::{CapturePolicy, ExecutionPolicy, OverflowBehavior};
-    use crate::supervisor::ManagedLaunch;
 
     const EVENT_QUANTUM: Duration = Duration::from_millis(10);
-    const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
     const READ_CHUNK: usize = 8 * 1024;
+    const CHUNKS_PER_STREAM_TURN: usize = 8;
+
+    struct ManagedStartup {
+        id: u32,
+        stdin: Option<std::process::ChildStdin>,
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+    }
 
     pub(super) fn spawn_managed(prepared: PreparedCommand) -> Result<ManagedLaunch> {
+        let program = prepared.program.clone();
+        let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let supervisor = thread::Builder::new()
+            .name("epitelesis-managed-supervisor".to_owned())
+            .spawn(move || managed_supervisor(prepared, &cancel_rx, startup_tx, result_tx))
+            .map_err(|source| {
+                SupervisorStartFailedSnafu {
+                    program: program.clone(),
+                }
+                .into_error(source)
+            })?;
+
+        match startup_rx.recv() {
+            Ok(Ok(startup)) => Ok(ManagedLaunch {
+                id: startup.id,
+                stdin: startup.stdin,
+                stdout: startup.stdout,
+                stderr: startup.stderr,
+                cancel: cancel_tx,
+                result: result_rx,
+                supervisor,
+            }),
+            Ok(Err(error)) => {
+                let _ = supervisor.join();
+                Err(error)
+            }
+            Err(_) => {
+                let source = if supervisor.join().is_err() {
+                    std::io::Error::other("managed supervisor panicked before reporting startup")
+                } else {
+                    std::io::Error::other("managed supervisor exited before reporting startup")
+                };
+                Err(SupervisionFailedSnafu {
+                    program,
+                    evidence: unknown_evidence(),
+                }
+                .into_error(source))
+            }
+        }
+    }
+
+    fn managed_supervisor(
+        prepared: PreparedCommand,
+        cancel: &Receiver<()>,
+        startup: mpsc::SyncSender<Result<ManagedStartup>>,
+        result: mpsc::SyncSender<Result<ManagedOutput>>,
+    ) {
         let PreparedCommand {
             mut command,
             program,
@@ -118,108 +211,136 @@ mod unix {
             stdout_capture: _,
             stderr_capture: _,
         } = prepared;
-        let child = command.spawn().context(SpawnFailedSnafu {
-            program: program.clone(),
-        })?;
-        let mut owned = OwnedChild::new(child);
-        let id = owned.child_mut().id();
-        let stdin = owned.child_mut().stdin.take();
-        let stdout = owned.child_mut().stdout.take();
-        let stderr = owned.child_mut().stderr.take();
-        let (cancel_tx, cancel_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = supervise_managed(owned, program, execution, &cancel_rx);
-            let _ = result_tx.send(result);
-        });
-        Ok(ManagedLaunch {
-            id,
-            stdin,
-            stdout,
-            stderr,
-            cancel: cancel_tx,
-            result: result_rx,
-        })
+        let reaper = match start_background_reaper(&program) {
+            Ok(reaper) => reaper,
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return;
+            }
+        };
+        let started = Instant::now();
+        let deadline = match execution.deadline(started) {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let _ = startup.send(Err(error));
+                return;
+            }
+        };
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                let _ = startup.send(Err(SpawnFailedSnafu { program }.into_error(source)));
+                return;
+            }
+        };
+        let mut owned = OwnedChild::new(child, reaper);
+        let startup_value = ManagedStartup {
+            id: owned.id(),
+            stdin: owned.child_mut().and_then(|child| child.stdin.take()),
+            stdout: owned.child_mut().and_then(|child| child.stdout.take()),
+            stderr: owned.child_mut().and_then(|child| child.stderr.take()),
+        };
+        if startup.send(Ok(startup_value)).is_err() {
+            let _ = owned.signal_group();
+            let _ = owned.handoff_to_background_reaper();
+            return;
+        }
+        let terminal = supervise_managed(owned, program, execution, deadline, started, cancel);
+        let _ = result.send(terminal);
     }
 
     fn supervise_managed(
         mut owned: OwnedChild,
         program: String,
         execution: ExecutionPolicy,
+        deadline: Option<Instant>,
+        started: Instant,
         cancel: &Receiver<()>,
-    ) -> Result<ExitStatus> {
-        let started = Instant::now();
-        let deadline = execution.deadline(started);
-        let duration = execution.duration();
-        let primary = loop {
-            if owned.leader_exited().map_err(|source| {
-                SupervisionFailedSnafu {
-                    program: program.clone(),
-                    source,
-                    stdout: CapturedStream::redirected(),
-                    stderr: CapturedStream::redirected(),
-                    secondary: SecondaryErrors::default(),
-                }
-                .build()
-            })? {
-                break Primary::Exit;
+    ) -> Result<ManagedOutput> {
+        let mut observations = Observations::default();
+        loop {
+            observe_leader(&owned, &mut observations);
+            observations.cancelled |= cancellation_received(cancel);
+            observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
+            if settlement_triggered(&observations, false, false) {
+                break;
             }
-            if deadline.is_some_and(|value| Instant::now() >= value) {
-                break Primary::Deadline;
-            }
-            let wait = deadline
-                .map(|value| value.saturating_duration_since(Instant::now()))
-                .unwrap_or(EVENT_QUANTUM)
-                .min(EVENT_QUANTUM);
+            let wait = wait_quantum(deadline, None);
             match cancel.recv_timeout(wait) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => break Primary::Cancelled,
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => observations.cancelled = true,
                 Err(RecvTimeoutError::Timeout) => {}
             }
-        };
+        }
 
-        let mut secondary = SecondaryErrors::default();
-        if let Err(error) = owned.signal_group() {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                secondary.signal = Some(FailureEvidence::from_io("signal process group", &error));
+        let cleanup_deadline = cleanup_deadline();
+        let signal = signal_group(&owned);
+        let mut status = None;
+        let mut reap_disposition = LeaderReapDisposition::Unreaped;
+        while owned.has_child() && Instant::now() < cleanup_deadline {
+            observe_leader(&owned, &mut observations);
+            if observations.leader_waitable {
+                match owned.reap_waitable() {
+                    Ok(reaped) => {
+                        status = Some(reaped);
+                        reap_disposition = LeaderReapDisposition::Reaped;
+                    }
+                    Err(error) => {
+                        observations
+                            .reap_failures
+                            .push(FailureEvidence::from_io("reap process leader", &error));
+                        break;
+                    }
+                }
+            }
+            if owned.has_child() {
+                let wait = cleanup_deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(EVENT_QUANTUM);
+                match cancel.recv_timeout(wait) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                        observations.cancelled = true;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
             }
         }
-        let status = owned.reap().map_err(|source| {
-            SupervisionFailedSnafu {
-                program: program.clone(),
-                source,
-                stdout: CapturedStream::redirected(),
-                stderr: CapturedStream::redirected(),
-                secondary: SecondaryErrors::default(),
+
+        let leader_unsettled = owned.has_child();
+        if leader_unsettled {
+            match owned.handoff_to_background_reaper() {
+                Ok(()) => reap_disposition = LeaderReapDisposition::BackgroundReaper,
+                Err(failure) => observations.reap_failures.push(failure),
             }
-            .build()
-        })?;
-        match primary {
-            Primary::Exit => Ok(status),
-            Primary::Deadline => TimeoutSnafu {
-                program,
-                duration: duration.unwrap_or_default(),
-                stdout: CapturedStream::redirected(),
-                stderr: CapturedStream::redirected(),
-                secondary,
-            }
-            .fail(),
-            Primary::Cancelled => CancelledSnafu {
-                program,
-                stdout: CapturedStream::redirected(),
-                stderr: CapturedStream::redirected(),
-                secondary,
-            }
-            .fail(),
-            Primary::Limit { .. } | Primary::CaptureFailure | Primary::Supervision(_) => {
-                SupervisionFailedSnafu {
-                    program,
-                    source: std::io::Error::other("invalid managed supervisor state"),
-                    stdout: CapturedStream::redirected(),
-                    stderr: CapturedStream::redirected(),
-                    secondary,
-                }
-                .fail()
-            }
+        }
+        let cleanup = if leader_unsettled {
+            CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
+                unfinished_streams: Vec::new(),
+                leader_unsettled: true,
+                cleanup_budget: CLEANUP_BUDGET,
+            })
+        } else {
+            CleanupOutcome::Complete
+        };
+        let primary = choose_primary(&mut observations, None, None);
+        let evidence = Box::new(LifecycleEvidence {
+            leader_status: status,
+            elapsed: Some(started.elapsed()),
+            signal,
+            reap: LeaderReapOutcome {
+                disposition: reap_disposition,
+                failures: observations.reap_failures,
+            },
+            stdout: redirected_report(StreamName::Stdout),
+            stderr: redirected_report(StreamName::Stderr),
+            cleanup,
+        });
+        classify_managed(primary, program, execution.duration(), evidence)
+    }
+
+    fn cancellation_received(cancel: &Receiver<()>) -> bool {
+        match cancel.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => true,
+            Err(TryRecvError::Empty) => false,
         }
     }
 
@@ -231,9 +352,6 @@ mod unix {
             stdout_capture,
             stderr_capture,
         } = prepared;
-        let started = Instant::now();
-        let deadline = execution.deadline(started);
-        let timeout = execution.duration();
         let span = tracing::info_span!(
             "epitelesis.supervise",
             program = %program,
@@ -241,233 +359,267 @@ mod unix {
             policy = ?execution,
         );
         let _entered = span.enter();
+        let reaper = start_background_reaper(&program)?;
+        let started = Instant::now();
+        let deadline = execution.deadline(started)?;
+        let configured_deadline = execution.duration();
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => return Err(SpawnFailedSnafu { program }.into_error(source)),
+        };
+        let mut owned = OwnedChild::new(child, reaper);
+        drop(owned.child_mut().and_then(|child| child.stdin.take()));
 
-        let child = command.spawn().context(SpawnFailedSnafu {
-            program: program.clone(),
-        })?;
-        let mut owned = OwnedChild::new(child);
-        drop(owned.child_mut().stdin.take());
-
-        let (event_tx, event_rx) = mpsc::channel();
-        let stdout_worker = Worker::spawn(
+        let mut stdout = CaptureStream::new(
             StreamName::Stdout,
-            owned.child_mut().stdout.take(),
+            owned.child_mut().and_then(|child| child.stdout.take()),
             stdout_capture,
-            event_tx.clone(),
         );
-        let stderr_worker = Worker::spawn(
+        let mut stderr = CaptureStream::new(
             StreamName::Stderr,
-            owned.child_mut().stderr.take(),
+            owned.child_mut().and_then(|child| child.stderr.take()),
             stderr_capture,
-            event_tx.clone(),
         );
-        drop(event_tx);
+        stdout.make_nonblocking();
+        stderr.make_nonblocking();
 
-        let mut outcomes = Outcomes::new(stdout_worker, stderr_worker);
         let mut observations = Observations::default();
-        let primary = loop {
-            outcomes.drain_events(&event_rx, &mut observations);
+        let mut stdout_first = true;
+        loop {
+            observe_leader(&owned, &mut observations);
             observations.cancelled |= cancellation.is_cancelled();
-            if !observations.leader_exited && observations.observe_error.is_none() {
-                match owned.leader_exited() {
-                    Ok(exited) => observations.leader_exited = exited,
-                    Err(error) => observations.observe_error = Some(error),
-                }
-            }
             observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
-
-            if let Some(primary) = choose_primary(&observations, &outcomes) {
-                break primary;
+            if settlement_triggered(
+                &observations,
+                stdout.overflow().is_some() || stderr.overflow().is_some(),
+                stdout.failed() || stderr.failed(),
+            ) {
+                break;
             }
 
-            let wait = deadline
-                .map(|value| value.saturating_duration_since(Instant::now()))
-                .unwrap_or(EVENT_QUANTUM)
-                .min(EVENT_QUANTUM);
-            match event_rx.recv_timeout(wait) {
-                Ok(event) => outcomes.apply_event(event, &mut observations),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
-            }
-        };
-
-        let cleanup_deadline = Instant::now()
-            .checked_add(CLEANUP_BUDGET)
-            .unwrap_or_else(Instant::now);
-        let mut secondary = SecondaryErrors::default();
-        if let Err(error) = owned.signal_group() {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                secondary.signal = Some(FailureEvidence::from_io("signal process group", &error));
-            }
-        }
-
-        while !observations.leader_exited && Instant::now() < cleanup_deadline {
-            outcomes.drain_events(&event_rx, &mut observations);
-            match owned.leader_exited() {
-                Ok(exited) => observations.leader_exited = exited,
+            let wait = wait_quantum(deadline, None);
+            match poll_streams(&stdout, &stderr, wait) {
+                Ok((stdout_ready, stderr_ready)) => pump_fair(
+                    &mut stdout,
+                    &mut stderr,
+                    stdout_ready,
+                    stderr_ready,
+                    &mut stdout_first,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => {
-                    if observations.observe_error.is_none() {
-                        observations.observe_error = Some(error);
+                    observations.observe_error.get_or_insert(error);
+                }
+            }
+        }
+
+        let cleanup_deadline = cleanup_deadline();
+        let signal = signal_group(&owned);
+        let mut status = None;
+        let mut reap_disposition = LeaderReapDisposition::Unreaped;
+        let mut reap_attempted = false;
+        while Instant::now() < cleanup_deadline {
+            observations.cancelled |= cancellation.is_cancelled();
+            observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
+            observe_leader(&owned, &mut observations);
+            if observations.leader_waitable && owned.has_child() && !reap_attempted {
+                reap_attempted = true;
+                match owned.reap_waitable() {
+                    Ok(reaped) => {
+                        status = Some(reaped);
+                        reap_disposition = LeaderReapDisposition::Reaped;
                     }
-                    break;
+                    Err(error) => {
+                        observations
+                            .reap_failures
+                            .push(FailureEvidence::from_io("reap process leader", &error));
+                    }
                 }
             }
-            if !observations.leader_exited {
-                let remaining = cleanup_deadline.saturating_duration_since(Instant::now());
-                match event_rx.recv_timeout(remaining.min(EVENT_QUANTUM)) {
-                    Ok(event) => outcomes.apply_event(event, &mut observations),
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            if !owned.has_child() && stdout.terminal() && stderr.terminal() {
+                break;
+            }
+            let wait = wait_quantum(None, Some(cleanup_deadline));
+            match poll_streams(&stdout, &stderr, wait) {
+                Ok((stdout_ready, stderr_ready)) => pump_fair(
+                    &mut stdout,
+                    &mut stderr,
+                    stdout_ready,
+                    stderr_ready,
+                    &mut stdout_first,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    observations.observe_error.get_or_insert(error);
                 }
             }
         }
 
-        let status = match owned.reap() {
-            Ok(status) => Some(status),
-            Err(error) => {
-                secondary.reap = Some(FailureEvidence::from_io("reap process leader", &error));
-                None
+        let leader_unsettled = owned.has_child();
+        if leader_unsettled {
+            match owned.handoff_to_background_reaper() {
+                Ok(()) => reap_disposition = LeaderReapDisposition::BackgroundReaper,
+                Err(failure) => observations.reap_failures.push(failure),
             }
+        }
+        let unfinished_streams = [(&stdout, StreamName::Stdout), (&stderr, StreamName::Stderr)]
+            .into_iter()
+            .filter_map(|(stream, name)| (!stream.terminal()).then_some(name))
+            .collect::<Vec<_>>();
+        let cleanup = if leader_unsettled || !unfinished_streams.is_empty() {
+            CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
+                unfinished_streams,
+                leader_unsettled,
+                cleanup_budget: CLEANUP_BUDGET,
+            })
+        } else {
+            CleanupOutcome::Complete
         };
-
-        while !outcomes.complete() && Instant::now() < cleanup_deadline {
-            let remaining = cleanup_deadline.saturating_duration_since(Instant::now());
-            match event_rx.recv_timeout(remaining.min(EVENT_QUANTUM)) {
-                Ok(event) => outcomes.apply_event(event, &mut observations),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
-            }
-        }
-        outcomes.drain_events(&event_rx, &mut observations);
-
-        let cleanup = outcomes.cleanup_evidence();
-        let (stdout, stderr) = outcomes.into_reports();
-        secondary.stdout_capture = stdout.failure.clone();
-        secondary.stderr_capture = stderr.failure.clone();
-        secondary.cleanup = cleanup.clone();
+        let stdout_overflow = stdout.overflow();
+        let stderr_overflow = stderr.overflow();
+        let primary = choose_primary(&mut observations, stdout_overflow, stderr_overflow);
+        let elapsed = started.elapsed();
+        let evidence = Box::new(LifecycleEvidence {
+            leader_status: status,
+            elapsed: Some(elapsed),
+            signal,
+            reap: LeaderReapOutcome {
+                disposition: reap_disposition,
+                failures: observations.reap_failures,
+            },
+            stdout: stdout.into_report(),
+            stderr: stderr.into_report(),
+            cleanup,
+        });
 
         tracing::debug!(
-            primary = ?primary,
-            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            stdout_bytes = stdout.captured.len(),
-            stderr_bytes = stderr.captured.len(),
+            duration_ms = duration_millis(elapsed),
+            stdout_bytes = evidence.stdout.captured.len(),
+            stderr_bytes = evidence.stderr.captured.len(),
             "invocation supervision settled"
         );
 
-        classify(
-            primary,
-            program,
-            timeout,
-            status,
-            stdout,
-            stderr,
-            secondary,
-            cleanup,
-            started.elapsed(),
-        )
+        classify(primary, program, configured_deadline, evidence)
     }
 
-    fn classify(
-        primary: Primary,
-        program: String,
-        timeout: Option<Duration>,
-        status: Option<ExitStatus>,
-        stdout: CaptureReport,
-        stderr: CaptureReport,
-        secondary: SecondaryErrors,
-        cleanup: Option<CleanupIncompleteEvidence>,
-        duration: Duration,
-    ) -> Result<Output> {
-        match primary {
-            Primary::Deadline => TimeoutSnafu {
-                program,
-                duration: timeout.unwrap_or_default(),
-                stdout: stdout.captured,
-                stderr: stderr.captured,
-                secondary,
+    fn duration_millis(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn cleanup_deadline() -> Instant {
+        let now = Instant::now();
+        now.checked_add(CLEANUP_BUDGET).unwrap_or(now)
+    }
+
+    fn signal_group(owned: &OwnedChild) -> GroupSignalOutcome {
+        match owned.signal_group() {
+            Ok(()) => GroupSignalOutcome::Sent,
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
+                GroupSignalOutcome::AlreadyGone
             }
-            .fail(),
-            Primary::Limit { stream, limit } => CaptureLimitExceededSnafu {
-                program,
-                stream,
-                limit,
-                stdout: stdout.captured,
-                stderr: stderr.captured,
-                secondary,
-            }
-            .fail(),
-            Primary::Cancelled => CancelledSnafu {
-                program,
-                stdout: stdout.captured,
-                stderr: stderr.captured,
-                secondary,
-            }
-            .fail(),
-            Primary::Supervision(error) => SupervisionFailedSnafu {
-                program,
-                source: error,
-                stdout: stdout.captured,
-                stderr: stderr.captured,
-                secondary,
-            }
-            .fail(),
-            Primary::CaptureFailure => CaptureFailedSnafu {
-                program,
-                stdout,
-                stderr,
-                secondary,
-            }
-            .fail(),
-            Primary::Exit => {
-                if stdout.failure.is_some() || stderr.failure.is_some() {
-                    return CaptureFailedSnafu {
-                        program,
-                        stdout,
-                        stderr,
-                        secondary,
-                    }
-                    .fail();
-                }
-                if let Some(evidence) = cleanup {
-                    return CleanupIncompleteSnafu {
-                        program,
-                        stdout: stdout.captured,
-                        stderr: stderr.captured,
-                        evidence,
-                        secondary,
-                    }
-                    .fail();
-                }
-                let Some(status) = status else {
-                    return SupervisionFailedSnafu {
-                        program,
-                        source: std::io::Error::other("process leader had no reap status"),
-                        stdout: stdout.captured,
-                        stderr: stderr.captured,
-                        secondary,
-                    }
-                    .fail();
-                };
-                let output = Output {
-                    status,
-                    stdout: stdout.captured,
-                    stderr: stderr.captured,
-                    duration,
-                };
-                if output.success() {
-                    Ok(output)
-                } else {
-                    NonZeroExitSnafu { program, output }.fail()
-                }
+            Err(error) => {
+                GroupSignalOutcome::Failed(FailureEvidence::from_io("signal process group", &error))
             }
         }
+    }
+
+    fn observe_leader(owned: &OwnedChild, observations: &mut Observations) {
+        if observations.leader_waitable
+            || observations.observe_error.is_some()
+            || !owned.has_child()
+        {
+            return;
+        }
+        match owned.leader_waitable() {
+            Ok(waitable) => observations.leader_waitable = waitable,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => observations.observe_error = Some(error),
+        }
+    }
+
+    fn wait_quantum(deadline: Option<Instant>, cleanup: Option<Instant>) -> Duration {
+        let now = Instant::now();
+        let until_deadline = deadline.map_or(EVENT_QUANTUM, |value| {
+            value.saturating_duration_since(now).min(EVENT_QUANTUM)
+        });
+        cleanup.map_or(until_deadline, |value| {
+            until_deadline.min(value.saturating_duration_since(now))
+        })
+    }
+
+    fn poll_streams(
+        stdout: &CaptureStream<ChildStdout>,
+        stderr: &CaptureStream<ChildStderr>,
+        timeout: Duration,
+    ) -> std::io::Result<(bool, bool)> {
+        let events = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+        // EVENT_QUANTUM is below one second, so this also fits 32-bit c_long.
+        let nanoseconds = timeout.subsec_nanos() as Nsecs;
+        let timespec = Timespec {
+            tv_sec: 0,
+            tv_nsec: nanoseconds,
+        };
+        match (stdout.pipe.as_ref(), stderr.pipe.as_ref()) {
+            (Some(stdout_pipe), Some(stderr_pipe)) => {
+                let mut descriptors = [
+                    PollFd::new(stdout_pipe, events),
+                    PollFd::new(stderr_pipe, events),
+                ];
+                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+                Ok((
+                    !descriptors[0].revents().is_empty(),
+                    !descriptors[1].revents().is_empty(),
+                ))
+            }
+            (Some(stdout_pipe), None) => {
+                let mut descriptors = [PollFd::new(stdout_pipe, events)];
+                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+                Ok((!descriptors[0].revents().is_empty(), false))
+            }
+            (None, Some(stderr_pipe)) => {
+                let mut descriptors = [PollFd::new(stderr_pipe, events)];
+                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+                Ok((false, !descriptors[0].revents().is_empty()))
+            }
+            (None, None) => {
+                thread::sleep(timeout);
+                Ok((false, false))
+            }
+        }
+    }
+
+    fn pump_fair(
+        stdout: &mut CaptureStream<ChildStdout>,
+        stderr: &mut CaptureStream<ChildStderr>,
+        stdout_ready: bool,
+        stderr_ready: bool,
+        stdout_first: &mut bool,
+    ) {
+        if *stdout_first {
+            if stdout_ready {
+                stdout.pump(CHUNKS_PER_STREAM_TURN);
+            }
+            if stderr_ready {
+                stderr.pump(CHUNKS_PER_STREAM_TURN);
+            }
+        } else {
+            if stderr_ready {
+                stderr.pump(CHUNKS_PER_STREAM_TURN);
+            }
+            if stdout_ready {
+                stdout.pump(CHUNKS_PER_STREAM_TURN);
+            }
+        }
+        *stdout_first = !*stdout_first;
     }
 
     #[derive(Default)]
     struct Observations {
-        stdout_limit: Option<usize>,
-        stderr_limit: Option<usize>,
         cancelled: bool,
         deadline_elapsed: bool,
-        leader_exited: bool,
+        leader_waitable: bool,
         observe_error: Option<std::io::Error>,
+        reap_failures: Vec<FailureEvidence>,
     }
 
     #[derive(Debug)]
@@ -476,379 +628,455 @@ mod unix {
         Cancelled,
         Deadline,
         CaptureFailure,
-        Exit,
         Supervision(std::io::Error),
+        Exit,
     }
 
-    fn choose_primary(observations: &mut Observations, outcomes: &Outcomes) -> Option<Primary> {
-        if let Some(limit) = observations.stdout_limit {
-            return Some(Primary::Limit {
+    fn settlement_triggered(
+        observations: &Observations,
+        overflow: bool,
+        capture_failed: bool,
+    ) -> bool {
+        overflow
+            || observations.cancelled
+            || observations.deadline_elapsed
+            || capture_failed
+            || observations.observe_error.is_some()
+            || observations.leader_waitable
+    }
+
+    fn choose_primary(
+        observations: &mut Observations,
+        stdout_overflow: Option<usize>,
+        stderr_overflow: Option<usize>,
+    ) -> Primary {
+        if let Some(limit) = stdout_overflow {
+            return Primary::Limit {
                 stream: StreamName::Stdout,
                 limit,
-            });
+            };
         }
-        if let Some(limit) = observations.stderr_limit {
-            return Some(Primary::Limit {
+        if let Some(limit) = stderr_overflow {
+            return Primary::Limit {
                 stream: StreamName::Stderr,
                 limit,
-            });
+            };
         }
         if observations.cancelled {
-            return Some(Primary::Cancelled);
+            return Primary::Cancelled;
         }
         if observations.deadline_elapsed {
-            return Some(Primary::Deadline);
+            return Primary::Deadline;
         }
-        if outcomes.capture_failed() {
-            return Some(Primary::CaptureFailure);
+        if observations.observe_error.is_none() {
+            return Primary::Exit;
         }
-        if let Some(error) = observations.observe_error.take() {
-            return Some(Primary::Supervision(error));
+        match observations.observe_error.take() {
+            Some(error) => Primary::Supervision(error),
+            None => Primary::Exit,
         }
-        observations.leader_exited.then_some(Primary::Exit)
     }
 
-    enum Event {
-        Overflow { stream: StreamName, limit: usize },
-        Report(CaptureReport),
-    }
-
-    struct Outcomes {
-        stdout: Option<CaptureReport>,
-        stderr: Option<CaptureReport>,
-        stdout_worker: Worker,
-        stderr_worker: Worker,
-    }
-
-    impl Outcomes {
-        fn new(stdout_worker: Worker, stderr_worker: Worker) -> Self {
-            Self {
-                stdout: stdout_worker.immediate_report(),
-                stderr: stderr_worker.immediate_report(),
-                stdout_worker,
-                stderr_worker,
-            }
-        }
-
-        fn apply_event(&mut self, event: Event, observations: &mut Observations) {
-            match event {
-                Event::Overflow {
-                    stream: StreamName::Stdout,
-                    limit,
-                } => {
-                    observations.stdout_limit.get_or_insert(limit);
+    fn classify(
+        mut primary: Primary,
+        program: String,
+        deadline: Option<Duration>,
+        evidence: Box<LifecycleEvidence>,
+    ) -> Result<Output> {
+        if evidence.stdout.failure.is_some() || evidence.stderr.failure.is_some() {
+            primary = match primary {
+                Primary::Limit { .. } | Primary::Cancelled | Primary::Deadline => primary,
+                Primary::CaptureFailure | Primary::Supervision(_) | Primary::Exit => {
+                    Primary::CaptureFailure
                 }
-                Event::Overflow {
-                    stream: StreamName::Stderr,
-                    limit,
-                } => {
-                    observations.stderr_limit.get_or_insert(limit);
-                }
-                Event::Report(report) => match report.stream {
-                    StreamName::Stdout => {
-                        self.stdout.get_or_insert(report);
-                    }
-                    StreamName::Stderr => {
-                        self.stderr.get_or_insert(report);
-                    }
-                },
             };
         }
-
-        fn drain_events(&mut self, receiver: &Receiver<Event>, observations: &mut Observations) {
-            loop {
-                match receiver.try_recv() {
-                    Ok(event) => self.apply_event(event, observations),
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                }
-            }
-        }
-
-        fn complete(&self) -> bool {
-            self.stdout.is_some()
-                && self.stderr.is_some()
-                && self.stdout_worker.finished()
-                && self.stderr_worker.finished()
-        }
-
-        fn capture_failed(&self) -> bool {
-            self.stdout.is_some()
-                && self.stderr.is_some()
-                && (self
-                    .stdout
-                    .as_ref()
-                    .is_some_and(|report| report.failure.is_some())
-                    || self
-                        .stderr
-                        .as_ref()
-                        .is_some_and(|report| report.failure.is_some()))
-        }
-
-        fn cleanup_evidence(&self) -> Option<CleanupIncompleteEvidence> {
-            let mut unfinished_streams = Vec::new();
-            if self.stdout.is_none() || !self.stdout_worker.finished() {
-                unfinished_streams.push(StreamName::Stdout);
-            }
-            if self.stderr.is_none() || !self.stderr_worker.finished() {
-                unfinished_streams.push(StreamName::Stderr);
-            }
-            (!unfinished_streams.is_empty()).then_some(CleanupIncompleteEvidence {
-                unfinished_streams,
-                cleanup_budget: CLEANUP_BUDGET,
-            })
-        }
-
-        fn into_reports(self) -> (CaptureReport, CaptureReport) {
-            let stdout = self
-                .stdout
-                .unwrap_or_else(|| self.stdout_worker.snapshot_report());
-            let stderr = self
-                .stderr
-                .unwrap_or_else(|| self.stderr_worker.snapshot_report());
-            (stdout, stderr)
-        }
-    }
-
-    struct Worker {
-        stream: StreamName,
-        state: Option<Arc<Mutex<WorkerState>>>,
-        redirected: bool,
-        _handle: Option<JoinHandle<()>>,
-    }
-
-    impl Worker {
-        fn spawn<R: Read + Send + 'static>(
-            stream: StreamName,
-            pipe: Option<R>,
-            policy: CapturePolicy,
-            sender: mpsc::Sender<Event>,
-        ) -> Self {
-            let Some(mut pipe) = pipe else {
-                return Self {
-                    stream,
-                    state: None,
-                    redirected: true,
-                    _handle: None,
-                };
-            };
-            let state = Arc::new(Mutex::new(WorkerState::new(&policy)));
-            let worker_state = Arc::clone(&state);
-            let handle = thread::spawn(move || {
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    read_stream(&mut pipe, &policy, &worker_state, stream, &sender)
-                }));
-                let failure = match result {
-                    Ok(failure) => failure,
-                    Err(_) => Some(CaptureWorkerFailure::Panicked),
-                };
-                let captured = take_captured(&worker_state);
-                let _ = sender.send(Event::Report(CaptureReport {
-                    stream,
-                    captured,
-                    failure,
-                }));
-            });
-            Self {
+        match primary {
+            Primary::Limit { stream, limit } => CaptureLimitExceededSnafu {
+                program,
                 stream,
-                state: Some(state),
-                redirected: false,
-                _handle: Some(handle),
+                limit,
+                evidence,
             }
-        }
-
-        fn immediate_report(&self) -> Option<CaptureReport> {
-            self.redirected.then(|| CaptureReport {
-                stream: self.stream,
-                captured: CapturedStream::redirected(),
-                failure: None,
-            })
-        }
-
-        fn snapshot_report(&self) -> CaptureReport {
-            let captured = self
-                .state
-                .as_ref()
-                .map(snapshot_captured)
-                .unwrap_or_else(CapturedStream::redirected);
-            CaptureReport {
-                stream: self.stream,
-                captured,
-                failure: None,
+            .fail(),
+            Primary::Cancelled => CancelledSnafu { program, evidence }.fail(),
+            Primary::Deadline => match deadline {
+                Some(configured) => TimeoutSnafu {
+                    program,
+                    deadline: configured,
+                    evidence,
+                }
+                .fail(),
+                None => Err(SupervisionFailedSnafu { program, evidence }.into_error(
+                    std::io::Error::other("deadline elapsed without a configured deadline"),
+                )),
+            },
+            Primary::CaptureFailure => CaptureFailedSnafu { program, evidence }.fail(),
+            Primary::Supervision(source) => {
+                Err(SupervisionFailedSnafu { program, evidence }.into_error(source))
             }
-        }
-
-        fn finished(&self) -> bool {
-            self._handle
-                .as_ref()
-                .is_none_or(std::thread::JoinHandle::is_finished)
+            Primary::Exit => classify_exit(program, evidence)
+                .map(|(status, evidence)| Output::new(status, evidence)),
         }
     }
 
-    struct WorkerState {
-        buffer: CaptureBuffer,
+    fn classify_managed(
+        primary: Primary,
+        program: String,
+        deadline: Option<Duration>,
+        evidence: Box<LifecycleEvidence>,
+    ) -> Result<ManagedOutput> {
+        match primary {
+            Primary::Limit { .. } | Primary::CaptureFailure => {
+                CaptureFailedSnafu { program, evidence }.fail()
+            }
+            Primary::Cancelled => CancelledSnafu { program, evidence }.fail(),
+            Primary::Deadline => match deadline {
+                Some(configured) => TimeoutSnafu {
+                    program,
+                    deadline: configured,
+                    evidence,
+                }
+                .fail(),
+                None => Err(SupervisionFailedSnafu { program, evidence }.into_error(
+                    std::io::Error::other("deadline elapsed without a configured deadline"),
+                )),
+            },
+            Primary::Supervision(source) => {
+                Err(SupervisionFailedSnafu { program, evidence }.into_error(source))
+            }
+            Primary::Exit => classify_exit(program, evidence)
+                .map(|(status, evidence)| ManagedOutput::new(status, evidence)),
+        }
+    }
+
+    fn classify_exit(
+        program: String,
+        evidence: Box<LifecycleEvidence>,
+    ) -> Result<(ExitStatus, Box<LifecycleEvidence>)> {
+        if matches!(&evidence.cleanup, CleanupOutcome::Incomplete(_)) {
+            return CleanupIncompleteSnafu { program, evidence }.fail();
+        }
+        if matches!(&evidence.cleanup, CleanupOutcome::Unknown) {
+            return Err(SupervisionFailedSnafu { program, evidence }
+                .into_error(std::io::Error::other("cleanup outcome was not recovered")));
+        }
+        if matches!(&evidence.signal, GroupSignalOutcome::Unknown)
+            || matches!(evidence.reap.disposition, LeaderReapDisposition::Unknown)
+        {
+            return Err(SupervisionFailedSnafu { program, evidence }.into_error(
+                std::io::Error::other("signal or reap outcome was not recovered"),
+            ));
+        }
+        if matches!(&evidence.signal, GroupSignalOutcome::Failed(_))
+            || !evidence.reap.failures.is_empty()
+            || matches!(evidence.reap.disposition, LeaderReapDisposition::Unreaped)
+        {
+            return LifecycleFailedSnafu { program, evidence }.fail();
+        }
+        match evidence.leader_status {
+            Some(status) if status.success() => Ok((status, evidence)),
+            Some(_) => NonZeroExitSnafu { program, evidence }.fail(),
+            None => Err(SupervisionFailedSnafu { program, evidence }
+                .into_error(std::io::Error::other("process leader had no reaped status"))),
+        }
+    }
+
+    fn redirected_report(stream: StreamName) -> CaptureReport {
+        CaptureReport {
+            stream,
+            captured: CapturedStream::redirected(),
+            failure: None,
+        }
+    }
+
+    fn unknown_report(stream: StreamName) -> CaptureReport {
+        CaptureReport {
+            stream,
+            captured: CapturedStream::unknown(),
+            failure: None,
+        }
+    }
+
+    fn unknown_evidence() -> Box<LifecycleEvidence> {
+        Box::new(LifecycleEvidence {
+            leader_status: None,
+            elapsed: None,
+            signal: GroupSignalOutcome::Unknown,
+            reap: LeaderReapOutcome {
+                disposition: LeaderReapDisposition::Unknown,
+                failures: Vec::new(),
+            },
+            stdout: unknown_report(StreamName::Stdout),
+            stderr: unknown_report(StreamName::Stderr),
+            cleanup: CleanupOutcome::Unknown,
+        })
+    }
+
+    struct CaptureStream<Pipe> {
+        name: StreamName,
+        pipe: Option<Pipe>,
+        storage: CaptureStorage,
         discarded: u64,
+        overflow: Option<usize>,
+        failure: Option<CaptureFailure>,
+        eof: bool,
+        redirected: bool,
     }
 
-    enum CaptureBuffer {
-        Bounded { storage: Box<[u8]>, len: usize },
+    enum CaptureStorage {
+        Bounded {
+            bytes: Vec<u8>,
+            limit: usize,
+            overflow: OverflowBehavior,
+        },
         Unbounded(Vec<u8>),
     }
 
-    impl WorkerState {
-        fn new(policy: &CapturePolicy) -> Self {
-            let buffer = match policy {
-                CapturePolicy::Bounded { limit, .. } => CaptureBuffer::Bounded {
-                    storage: vec![0; *limit].into_boxed_slice(),
-                    len: 0,
+    impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
+        fn new(name: StreamName, pipe: Option<Pipe>, policy: CapturePolicy) -> Self {
+            let redirected = pipe.is_none();
+            let storage = match policy {
+                CapturePolicy::Bounded { limit, overflow } => CaptureStorage::Bounded {
+                    bytes: Vec::new(),
+                    limit,
+                    overflow,
                 },
-                CapturePolicy::Unbounded(_) => {
-                    CaptureBuffer::Unbounded(Vec::with_capacity(READ_CHUNK))
-                }
+                CapturePolicy::Unbounded(_) => CaptureStorage::Unbounded(Vec::new()),
             };
             Self {
-                buffer,
+                name,
+                pipe,
+                storage,
                 discarded: 0,
+                overflow: None,
+                failure: None,
+                eof: false,
+                redirected,
             }
         }
-    }
 
-    fn read_stream<R: Read>(
-        pipe: &mut R,
-        policy: &CapturePolicy,
-        state: &Arc<Mutex<WorkerState>>,
-        stream: StreamName,
-        sender: &mpsc::Sender<Event>,
-    ) -> Option<CaptureWorkerFailure> {
-        let mut chunk = [0_u8; READ_CHUNK];
-        let mut overflow_sent = false;
-        loop {
-            let count = match pipe.read(&mut chunk) {
-                Ok(0) => return None,
-                Ok(count) => count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Some(CaptureWorkerFailure::Read {
-                        kind: error.kind(),
-                        message: error.to_string(),
-                    });
+        fn make_nonblocking(&mut self) {
+            let result = self.pipe.as_ref().map(|pipe| {
+                fcntl_getfl(pipe)
+                    .and_then(|flags| fcntl_setfl(pipe, flags | OFlags::NONBLOCK))
+                    .map_err(errno_to_io)
+            });
+            if let Some(Err(error)) = result {
+                self.record_failure(error);
+            }
+        }
+
+        fn pump(&mut self, chunk_budget: usize) {
+            for _ in 0..chunk_budget {
+                let mut chunk = [0_u8; READ_CHUNK];
+                let read = match self.pipe.as_mut() {
+                    Some(pipe) => pipe.read(&mut chunk),
+                    None => return,
+                };
+                match read {
+                    Ok(0) => {
+                        self.eof = true;
+                        self.pipe = None;
+                        return;
+                    }
+                    Ok(count) => self.retain(&chunk[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    Err(error) => {
+                        self.record_failure(error);
+                        return;
+                    }
                 }
-            };
-            let mut locked = lock_state(state);
-            match policy {
-                CapturePolicy::Unbounded(_) => match &mut locked.buffer {
-                    CaptureBuffer::Unbounded(bytes) => bytes.extend_from_slice(&chunk[..count]),
-                    CaptureBuffer::Bounded { .. } => {
-                        panic!("capture policy and worker buffer diverged")
+            }
+        }
+
+        fn retain(&mut self, chunk: &[u8]) {
+            let mut allocation_failed = false;
+            match &mut self.storage {
+                CaptureStorage::Unbounded(bytes) => match bytes.try_reserve(chunk.len()) {
+                    Ok(()) => bytes.extend_from_slice(chunk),
+                    Err(_) => {
+                        self.discarded = self.discarded.saturating_add(usize_to_u64(chunk.len()));
+                        allocation_failed = true;
                     }
                 },
-                CapturePolicy::Bounded { limit, overflow } => {
-                    let retained = match &mut locked.buffer {
-                        CaptureBuffer::Bounded { storage, len } => {
-                            let retained = count.min(limit.saturating_sub(*len));
-                            let end = *len + retained;
-                            storage[*len..end].copy_from_slice(&chunk[..retained]);
-                            *len = end;
-                            retained
+                CaptureStorage::Bounded {
+                    bytes,
+                    limit,
+                    overflow,
+                } => {
+                    let retained = chunk.len().min(limit.saturating_sub(bytes.len()));
+                    let discarded = chunk.len() - retained;
+                    self.discarded = self.discarded.saturating_add(usize_to_u64(discarded));
+                    if discarded > 0 && *overflow == OverflowBehavior::FailClosed {
+                        self.overflow.get_or_insert(*limit);
+                    }
+                    if retained > 0 {
+                        match bytes.try_reserve(retained) {
+                            Ok(()) => bytes.extend_from_slice(&chunk[..retained]),
+                            Err(_) => {
+                                self.discarded =
+                                    self.discarded.saturating_add(usize_to_u64(retained));
+                                allocation_failed = true;
+                            }
                         }
-                        CaptureBuffer::Unbounded(_) => {
-                            panic!("capture policy and worker buffer diverged")
-                        }
-                    };
-                    let discarded = count - retained;
-                    locked.discarded = locked
-                        .discarded
-                        .saturating_add(u64::try_from(discarded).unwrap_or(u64::MAX));
-                    if discarded > 0 && *overflow == OverflowBehavior::FailClosed && !overflow_sent
-                    {
-                        overflow_sent = true;
-                        let _ = sender.send(Event::Overflow {
-                            stream,
-                            limit: *limit,
-                        });
                     }
                 }
             }
+            if allocation_failed {
+                self.failure.get_or_insert(CaptureFailure::Allocation);
+                self.pipe = None;
+            }
+        }
+
+        fn record_failure(&mut self, error: std::io::Error) {
+            self.failure.get_or_insert(CaptureFailure::Read {
+                kind: error.kind(),
+                message: error.to_string(),
+            });
+            self.pipe = None;
+        }
+
+        fn failed(&self) -> bool {
+            self.failure.is_some()
+        }
+
+        fn overflow(&self) -> Option<usize> {
+            self.overflow
+        }
+
+        fn terminal(&self) -> bool {
+            self.redirected || self.eof || self.failure.is_some()
+        }
+
+        fn into_report(self) -> CaptureReport {
+            let bytes = match self.storage {
+                CaptureStorage::Bounded { bytes, .. } => bytes,
+                CaptureStorage::Unbounded(bytes) => bytes,
+            };
+            let captured = if self.redirected {
+                CapturedStream::redirected()
+            } else if self.eof {
+                CapturedStream::settled(bytes, self.discarded)
+            } else {
+                CapturedStream::incomplete(bytes, self.discarded)
+            };
+            CaptureReport {
+                stream: self.name,
+                captured,
+                failure: self.failure,
+            }
         }
     }
 
-    fn lock_state(state: &Arc<Mutex<WorkerState>>) -> MutexGuard<'_, WorkerState> {
-        match state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+    fn usize_to_u64(value: usize) -> u64 {
+        u64::try_from(value).unwrap_or(u64::MAX)
     }
 
-    fn take_captured(state: &Arc<Mutex<WorkerState>>) -> CapturedStream {
-        let mut state = lock_state(state);
-        let buffer = std::mem::replace(&mut state.buffer, CaptureBuffer::Unbounded(Vec::new()));
-        let bytes = match buffer {
-            CaptureBuffer::Bounded { storage, len } => {
-                let mut bytes = storage.into_vec();
-                bytes.truncate(len);
-                bytes.into_boxed_slice().into_vec()
-            }
-            CaptureBuffer::Unbounded(bytes) => bytes,
-        };
-        CapturedStream::complete(bytes, state.discarded)
-    }
-
-    fn snapshot_captured(state: &Arc<Mutex<WorkerState>>) -> CapturedStream {
-        let state = lock_state(state);
-        let bytes = match &state.buffer {
-            CaptureBuffer::Bounded { storage, len } => {
-                storage[..*len].to_vec().into_boxed_slice().into_vec()
-            }
-            CaptureBuffer::Unbounded(bytes) => bytes.clone(),
-        };
-        CapturedStream::complete(bytes, state.discarded)
+    fn start_background_reaper(program: &str) -> Result<mpsc::SyncSender<Child>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _reaper = thread::Builder::new()
+            .name("epitelesis-background-reaper".to_owned())
+            .spawn(move || {
+                if let Ok(mut child) = receiver.recv() {
+                    let _ = child.wait();
+                }
+            })
+            .map_err(|source| {
+                ReaperStartFailedSnafu {
+                    program: program.to_owned(),
+                }
+                .into_error(source)
+            })?;
+        Ok(sender)
     }
 
     struct OwnedChild {
-        child: Child,
+        child: Option<Child>,
         pgid: Pid,
-        armed: bool,
+        reaper: Option<mpsc::SyncSender<Child>>,
     }
 
     impl OwnedChild {
-        fn new(child: Child) -> Self {
+        fn new(child: Child, reaper: mpsc::SyncSender<Child>) -> Self {
             let pgid = Pid::from_child(&child);
             Self {
-                child,
+                child: Some(child),
                 pgid,
-                armed: true,
+                reaper: Some(reaper),
             }
         }
 
-        fn child_mut(&mut self) -> &mut Child {
-            &mut self.child
+        fn id(&self) -> u32 {
+            self.child.as_ref().map_or(0, Child::id)
+        }
+
+        fn child_mut(&mut self) -> Option<&mut Child> {
+            self.child.as_mut()
+        }
+
+        fn has_child(&self) -> bool {
+            self.child.is_some()
         }
 
         fn signal_group(&self) -> std::io::Result<()> {
             kill_process_group(self.pgid, Signal::KILL).map_err(errno_to_io)
         }
 
-        fn leader_exited(&self) -> std::io::Result<bool> {
+        fn leader_waitable(&self) -> std::io::Result<bool> {
+            if self.child.is_none() {
+                return Ok(true);
+            }
             let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
             waitid(WaitId::Pid(self.pgid), options)
                 .map(|status| status.is_some())
                 .map_err(errno_to_io)
         }
 
-        fn reap(&mut self) -> std::io::Result<ExitStatus> {
-            let status = self.child_mut().wait()?;
-            self.armed = false;
-            Ok(status)
+        fn reap_waitable(&mut self) -> std::io::Result<ExitStatus> {
+            match self.child.as_mut() {
+                Some(child) => {
+                    let status = child.wait()?;
+                    self.child = None;
+                    Ok(status)
+                }
+                None => Err(std::io::Error::other("process leader was already reaped")),
+            }
+        }
+
+        fn handoff_to_background_reaper(&mut self) -> std::result::Result<(), FailureEvidence> {
+            let Some(child) = self.child.take() else {
+                return Ok(());
+            };
+            let Some(sender) = self.reaper.take() else {
+                self.child = Some(child);
+                return Err(FailureEvidence::from_io(
+                    "transfer child to background reaper",
+                    &std::io::Error::other("fallback reaper was unavailable"),
+                ));
+            };
+            if let Err(error) = sender.send(child) {
+                self.child = Some(error.0);
+                return Err(FailureEvidence::from_io(
+                    "transfer child to background reaper",
+                    &std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "background reaper stopped before ownership transfer",
+                    ),
+                ));
+            }
+            Ok(())
         }
     }
 
     impl Drop for OwnedChild {
         fn drop(&mut self) {
-            if !self.armed {
+            if self.child.is_none() {
                 return;
             }
             let _ = kill_process_group(self.pgid, Signal::KILL);
-            let _ = self.child.wait();
-            self.armed = false;
+            let _ = self.handoff_to_background_reaper();
         }
     }
 
@@ -861,118 +1089,186 @@ mod unix {
         use super::*;
 
         #[test]
-        fn primary_race_precedence_is_stable() {
-            let stdout = Worker {
-                stream: StreamName::Stdout,
-                state: None,
-                redirected: true,
-                _handle: None,
-            };
-            let stderr = Worker {
-                stream: StreamName::Stderr,
-                state: None,
-                redirected: true,
-                _handle: None,
-            };
-            let outcomes = Outcomes::new(stdout, stderr);
-            let mut all = Observations {
-                stdout_limit: Some(7),
-                stderr_limit: Some(9),
+        fn primary_precedence_is_stable() {
+            let mut observations = Observations {
                 cancelled: true,
                 deadline_elapsed: true,
-                leader_exited: true,
-                observe_error: None,
+                leader_waitable: true,
+                observe_error: Some(std::io::Error::other("observe")),
+                reap_failures: Vec::new(),
             };
             assert!(matches!(
-                choose_primary(&mut all, &outcomes),
-                Some(Primary::Limit {
+                choose_primary(&mut observations, Some(7), Some(9)),
+                Primary::Limit {
                     stream: StreamName::Stdout,
                     limit: 7
-                })
+                }
             ));
-
-            all.stdout_limit = None;
-            all.stderr_limit = None;
             assert!(matches!(
-                choose_primary(&mut all, &outcomes),
-                Some(Primary::Cancelled)
+                choose_primary(&mut observations, None, Some(9)),
+                Primary::Limit {
+                    stream: StreamName::Stderr,
+                    limit: 9
+                }
             ));
-            all.cancelled = false;
             assert!(matches!(
-                choose_primary(&mut all, &outcomes),
-                Some(Primary::Deadline)
-            ));
-            all.deadline_elapsed = false;
-            assert!(matches!(
-                choose_primary(&mut all, &outcomes),
-                Some(Primary::Exit)
+                choose_primary(&mut observations, None, None),
+                Primary::Cancelled
             ));
         }
 
         #[test]
-        fn worker_matrix_resolves_stdout_before_stderr_with_peer_evidence() {
+        fn settlement_matrix_uses_classification_and_keeps_peer_bytes() {
             let outcomes = [
                 None,
-                Some(CaptureWorkerFailure::Panicked),
-                Some(CaptureWorkerFailure::Read {
+                Some(CaptureFailure::Read {
                     kind: std::io::ErrorKind::Other,
                     message: "fixture".to_owned(),
                 }),
+                Some(CaptureFailure::Allocation),
             ];
             for stdout_failure in &outcomes {
                 for stderr_failure in &outcomes {
-                    let stdout = CaptureReport {
-                        stream: StreamName::Stdout,
-                        captured: CapturedStream::complete(b"out".to_vec(), 0),
-                        failure: stdout_failure.clone(),
-                    };
-                    let stderr = CaptureReport {
-                        stream: StreamName::Stderr,
-                        captured: CapturedStream::complete(b"err".to_vec(), 0),
-                        failure: stderr_failure.clone(),
-                    };
-                    assert_eq!(stdout.stream, StreamName::Stdout);
-                    assert_eq!(stderr.stream, StreamName::Stderr);
-                    assert_eq!(stdout.captured.bytes, b"out");
-                    assert_eq!(stderr.captured.bytes, b"err");
+                    let evidence = fixture_evidence(stdout_failure.clone(), stderr_failure.clone());
+                    let result = classify(
+                        Primary::Exit,
+                        "fixture".to_owned(),
+                        Some(Duration::from_secs(1)),
+                        evidence,
+                    );
+                    if stdout_failure.is_none() && stderr_failure.is_none() {
+                        let output = match result {
+                            Ok(output) => output,
+                            Err(error) => panic!("success matrix cell failed: {error:?}"),
+                        };
+                        assert_eq!(output.evidence.stdout.captured.bytes, b"out");
+                        assert_eq!(output.evidence.stderr.captured.bytes, b"err");
+                    } else {
+                        let evidence = match result {
+                            Err(crate::Error::CaptureFailed { evidence, .. }) => evidence,
+                            other => panic!("capture matrix cell misclassified: {other:?}"),
+                        };
+                        assert_eq!(evidence.stdout.stream, StreamName::Stdout);
+                        assert_eq!(evidence.stderr.stream, StreamName::Stderr);
+                        assert_eq!(evidence.stdout.captured.bytes, b"out");
+                        assert_eq!(evidence.stderr.captured.bytes, b"err");
+                        let expected_first = if stdout_failure.is_some() {
+                            StreamName::Stdout
+                        } else {
+                            StreamName::Stderr
+                        };
+                        assert_eq!(evidence.first_capture_failure(), Some(expected_first));
+                    }
                 }
             }
         }
 
         #[test]
-        fn armed_guard_cleans_up_during_unwind() {
-            use std::os::unix::process::CommandExt as _;
+        fn unbounded_read_failure_triggers_cleanup_with_incomplete_peer() {
+            use std::os::fd::{AsFd, BorrowedFd};
 
-            let pid = Arc::new(Mutex::new(None));
-            let observed_pid = Arc::clone(&pid);
-            let unwind = catch_unwind(AssertUnwindSafe(move || {
-                let mut command = std::process::Command::new("/bin/sleep");
-                command.arg("30").process_group(0);
-                let child = match command.spawn() {
-                    Ok(child) => child,
-                    Err(error) => panic!("sleep fixture failed to spawn: {error}"),
-                };
-                *lock_optional_pid(&observed_pid) = Some(child.id());
-                let _owned = OwnedChild::new(child);
-                panic!("fixture unwind");
-            }));
-            assert!(unwind.is_err());
-            let pid = match *lock_optional_pid(&pid) {
-                Some(pid) => pid,
-                None => panic!("fixture never recorded its pid"),
+            struct FaultingPipe(std::fs::File);
+            impl Read for FaultingPipe {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::other("injected read failure"))
+                }
+            }
+            impl AsFd for FaultingPipe {
+                fn as_fd(&self) -> BorrowedFd<'_> {
+                    self.0.as_fd()
+                }
+            }
+
+            struct HoldingPipe(std::fs::File);
+            impl Read for HoldingPipe {
+                fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+            }
+            impl AsFd for HoldingPipe {
+                fn as_fd(&self) -> BorrowedFd<'_> {
+                    self.0.as_fd()
+                }
+            }
+
+            let stdout_file = match std::fs::File::open("/dev/null") {
+                Ok(file) => file,
+                Err(error) => panic!("stdout fixture failed: {error}"),
             };
-            #[cfg(target_os = "linux")]
-            assert!(
-                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-                "armed guard must kill and reap during unwind"
+            let stderr_file = match std::fs::File::open("/dev/null") {
+                Ok(file) => file,
+                Err(error) => panic!("stderr fixture failed: {error}"),
+            };
+            let policy = match CapturePolicy::unbounded("fault-injection fixture") {
+                Ok(policy) => policy,
+                Err(error) => panic!("unbounded fixture policy failed: {error:?}"),
+            };
+            let mut stdout =
+                CaptureStream::new(StreamName::Stdout, Some(FaultingPipe(stdout_file)), policy);
+            let mut stderr = CaptureStream::new(
+                StreamName::Stderr,
+                Some(HoldingPipe(stderr_file)),
+                CapturePolicy::bounded(8),
             );
+            stdout.pump(1);
+            stderr.pump(1);
+
+            assert!(stdout.failed());
+            assert!(!stderr.terminal());
+            assert!(settlement_triggered(
+                &Observations::default(),
+                false,
+                stdout.failed()
+            ));
+            let stdout = stdout.into_report();
+            let stderr = stderr.into_report();
+            assert!(stdout.failure.is_some());
+            assert!(matches!(
+                stdout.captured.completeness,
+                crate::CaptureCompleteness::Incomplete { .. }
+            ));
+            assert!(matches!(
+                stderr.captured.completeness,
+                crate::CaptureCompleteness::Incomplete { .. }
+            ));
         }
 
-        fn lock_optional_pid(value: &Arc<Mutex<Option<u32>>>) -> MutexGuard<'_, Option<u32>> {
-            match value.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            }
+        fn fixture_evidence(
+            stdout_failure: Option<CaptureFailure>,
+            stderr_failure: Option<CaptureFailure>,
+        ) -> Box<LifecycleEvidence> {
+            let status = match std::process::Command::new("/bin/true").status() {
+                Ok(status) => status,
+                Err(error) => panic!("true fixture failed: {error}"),
+            };
+            Box::new(LifecycleEvidence {
+                leader_status: Some(status),
+                elapsed: Some(Duration::from_millis(1)),
+                signal: GroupSignalOutcome::Sent,
+                reap: LeaderReapOutcome {
+                    disposition: LeaderReapDisposition::Reaped,
+                    failures: Vec::new(),
+                },
+                stdout: CaptureReport {
+                    stream: StreamName::Stdout,
+                    captured: if stdout_failure.is_some() {
+                        CapturedStream::incomplete(b"out".to_vec(), 0)
+                    } else {
+                        CapturedStream::settled(b"out".to_vec(), 0)
+                    },
+                    failure: stdout_failure,
+                },
+                stderr: CaptureReport {
+                    stream: StreamName::Stderr,
+                    captured: if stderr_failure.is_some() {
+                        CapturedStream::incomplete(b"err".to_vec(), 0)
+                    } else {
+                        CapturedStream::settled(b"err".to_vec(), 0)
+                    },
+                    failure: stderr_failure,
+                },
+                cleanup: CleanupOutcome::Complete,
+            })
         }
     }
 }

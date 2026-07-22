@@ -34,32 +34,56 @@ Environment policy is also explicit and fail-closed:
 - `Allowlist` exposes only named variables; and
 - `InheritAll` requires a reason.
 
-Captured stdout and stderr each default to a 10 MiB limit. Reaching either
-limit fails closed. A caller may instead choose explicit truncation, streaming,
-or exceptional unbounded capture; unbounded capture requires justification.
+Captured stdout and stderr each default to a 10 MiB limit. Crossing either
+limit fails closed. A caller may instead choose explicit truncation or
+exceptional unbounded capture; unbounded capture requires justification.
+Managed streaming is a different structural state created with
+`command.streaming()`, so default capture cannot be silently ignored.
 
 ## Lifecycle ownership
 
 One supervisor owns the invocation from spawn through final evidence. On Unix,
-it creates and supervises a process group, kills the group before reaping,
-performs bounded capture cleanup, and aggregates exit, termination, and capture
-evidence rather than losing later failures behind the first one.
+it creates and supervises a process group, pumps both capture pipes in one
+fair nonblocking `poll` loop, kills the group before reaping, and performs
+bounded cleanup. There are no capture reader threads. The caller-visible
+cleanup allowance is 2.1 seconds. If the leader remains unsettled, the
+supervisor attempts to transfer ownership to a deliberately named background
+reaper; typed reap disposition, failures, and cleanup evidence report the
+outcome. That fallback endpoint is established fallibly before process
+creation, so its startup cannot strand a running child.
 
 `ManagedChild` retains ownership of deadline handling, cancellation, and reap
-for caller-managed execution. Returning or dropping a handle must not silently
-detach those obligations.
+for caller-managed execution. Construct it only from `Command<Ready>` via
+`.streaming().spawn()` (or `spawn_managed(command.streaming())`). The caller
+owns bytes and backpressure after taking a pipe handle. `wait` closes retained
+stdin first, `poll` distinguishes running, successful, and failed terminal
+states without blocking, and `cancel` returns aggregate evidence only after
+complete cancellation cleanup. Drop requests cancellation and waits no longer
+than the documented cleanup allowance. If scheduling exhausts that allowance,
+the detached supervisor retains lifecycle ownership until it finishes.
 
 Platforms without the required process-group lifecycle return a typed
-unsupported error. Process groups are containment for ordinary descendant
-cleanup, not a security sandbox: a hostile child can call `setsid` and escape
-the group.
+unsupported error before spawn. This includes non-Unix platforms and Unix
+targets where rustix does not provide `waitid` (`cygwin`, `horizon`, `openbsd`,
+`redox`, and `wasi`). Process groups are containment for ordinary descendant
+cleanup, not a security sandbox: a hostile child can call `setsid` and escape.
 
 ## Evidence model
 
-Success and failure are typed outcomes. Evidence includes the observed exit or
-termination state, capture results governed by the selected policy, elapsed
-time, and any cleanup failures. Callers decide how to render or redact bytes;
-Epitelesis transports evidence and does not treat captured output as trusted.
+Every post-spawn terminal path owns one boxed `LifecycleEvidence`: optional
+leader status, recoverable elapsed time, typed process-group signal and leader
+reap outcomes, deterministic stdout/stderr reports, and a typed cleanup
+outcome. Only EOF produces `Complete` or `Truncated`; read failures and cleanup
+snapshots are `Incomplete`, while an unrecoverable adapter result is `Unknown`.
+Timeout errors retain both their configured deadline and known actual elapsed
+time. Callers decide how to render or redact bytes; Epitelesis does not trust
+them.
+
+Release truth has five synchronized files: `Cargo.toml`, the local
+`epitelesis` package in `Cargo.lock`, `.release-please-manifest.json`, the README
+dependency marker, and `_llm/current_state.toml`. The protected
+`gate / gate-attestation` context verifies them before allowing either the
+exact prose-only exemption or a successful hosted Rust build.
 
 ## Cargo features
 

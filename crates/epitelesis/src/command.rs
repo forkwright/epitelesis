@@ -280,9 +280,44 @@ impl Command<Ready> {
         crate::status(self)
     }
 
+    /// Explicitly transfer stdout/stderr byte and backpressure ownership to the caller.
+    #[must_use]
+    pub fn streaming(self) -> StreamingCommand {
+        StreamingCommand { command: self }
+    }
+}
+
+/// Explicit managed-streaming typestate.
+///
+/// Entering this state disables supervisor capture: the caller must take and
+/// drain piped handles, while the supervisor retains deadline, cancellation,
+/// process-group termination, and reap ownership.
+///
+/// ```compile_fail
+/// use epitelesis::Command;
+/// use std::time::Duration;
+///
+/// let captured = Command::new("/bin/true").deadline(Duration::from_secs(1))?;
+/// let _ = captured.spawn();
+/// # Ok::<(), epitelesis::Error>(())
+/// ```
+#[must_use]
+pub struct StreamingCommand {
+    pub(crate) command: Command<Ready>,
+}
+
+impl StreamingCommand {
     /// Spawn a managed streaming child whose lifecycle remains enforced.
     pub fn spawn(self) -> Result<crate::ManagedChild> {
         crate::spawn_managed(self)
+    }
+}
+
+impl std::fmt::Debug for StreamingCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StreamingCommand")
+            .field(&self.command)
+            .finish()
     }
 }
 
@@ -363,7 +398,16 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
     process.stdout(stdout.unwrap_or_else(Stdio::piped));
     process.stderr(stderr.unwrap_or_else(Stdio::piped));
 
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
     {
         use std::os::unix::process::CommandExt as _;
         process.process_group(0);
@@ -406,12 +450,30 @@ fn validate_path_policy<State>(command: &Command<State>) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
 fn validate_backend() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+)))]
 fn validate_backend() -> Result<()> {
     crate::error::UnsupportedCapabilitySnafu {
         capability: crate::error::Capability::OwnedProcessGroup,

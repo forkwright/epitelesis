@@ -19,14 +19,15 @@ unrepresentable and preserve evidence when cleanup has multiple outcomes.
 - `Clean` performs `env_clear` and is the default. `Allowlist` copies only named
   variables. `InheritAll` is reason-bearing.
 - Bounded capture defaults to 10 MiB for each stream and fails closed. Explicit
-  policies cover truncation, streaming, and exceptional reason-bearing
-  unbounded capture.
+  policies cover truncation and exceptional reason-bearing unbounded capture;
+  managed streaming is a separate structural command state.
 - A single supervisor owns spawn, observation, Unix process-group kill before
   reap, bounded capture cleanup, and aggregate evidence.
+- The single Unix event loop pumps both nonblocking capture pipes fairly; no
+  capture worker or detached capture thread exists.
 - `ManagedChild` owns deadline, cancellation, and reap rather than exposing a
-  detachable raw child lifecycle.
-- Non-Unix implementations that cannot satisfy the lifecycle return typed
-  unsupported errors.
+  detachable raw child lifecycle. Its caller owns streaming backpressure.
+- Backends without rustix `waitid` support return typed unsupported errors.
 - Process groups are not a sandbox because hostile code can call `setsid`.
 
 Sync and async runners implement the same contract. Async support remains
@@ -46,7 +47,8 @@ default.
 Use the exact commands documented in AGENTS.md for the full Rust gate. Release
 metadata changes also run the dependency-free Python verifier and its unittest
 suite. Keep release facts on the two same-line generic updater markers plus the
-workspace version and release manifest; do not add unmarked copies.
+workspace version, local lockfile package version, and release manifest; do not
+add unmarked copies.
 
 ## Git
 

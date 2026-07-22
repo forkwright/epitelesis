@@ -1,8 +1,13 @@
 //! Thin Tokio adapter over the shared blocking supervisor.
 
 use crate::Command;
-use crate::error::{Result, SecondaryErrors, SupervisionFailedSnafu};
-use crate::output::{CapturedStream, Output};
+use snafu::IntoError as _;
+
+use crate::error::{Result, SupervisionFailedSnafu};
+use crate::output::{
+    CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,
+    LeaderReapOutcome, LifecycleEvidence, Output, StreamName,
+};
 use crate::policy::Ready;
 
 struct CancelOnDrop {
@@ -32,15 +37,31 @@ pub async fn spawn(command: Command<Ready>) -> Result<Output> {
     let worker = tokio::task::spawn_blocking(move || {
         crate::supervisor::execute(command, worker_cancellation)
     });
-    let result = worker.await.map_err(|error| {
+    let result = worker.await.map_err(|source| {
         SupervisionFailedSnafu {
             program: "asynchronous supervisor".to_owned(),
-            source: std::io::Error::other(error.to_string()),
-            stdout: CapturedStream::redirected(),
-            stderr: CapturedStream::redirected(),
-            secondary: SecondaryErrors::default(),
+            evidence: Box::new(LifecycleEvidence {
+                leader_status: None,
+                elapsed: None,
+                signal: GroupSignalOutcome::Unknown,
+                reap: LeaderReapOutcome {
+                    disposition: LeaderReapDisposition::Unknown,
+                    failures: Vec::new(),
+                },
+                stdout: CaptureReport {
+                    stream: StreamName::Stdout,
+                    captured: CapturedStream::unknown(),
+                    failure: None,
+                },
+                stderr: CaptureReport {
+                    stream: StreamName::Stderr,
+                    captured: CapturedStream::unknown(),
+                    failure: None,
+                },
+                cleanup: CleanupOutcome::Unknown,
+            }),
         }
-        .build()
+        .into_error(std::io::Error::other(source))
     })?;
     guard.armed = false;
     result

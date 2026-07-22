@@ -11,10 +11,12 @@ or commit, and any suggested remediation.
 ## Security boundary
 
 Epitelesis enforces subprocess lifecycle policy; it is not a security sandbox.
-On Unix the supervisor kills the process group before reaping so ordinary
-descendants are cleaned up. A hostile child can call `setsid`, escape that
-group, and survive. Use a purpose-built OS sandbox or container when executing
-hostile code.
+On a supported Unix backend the supervisor kills the process group before
+reaping so ordinary descendants are cleaned up. Captured pipes are nonblocking
+and share the supervisor event loop; a noisy stream receives only a bounded
+turn before deadline and cancellation checks resume. A hostile child can call
+`setsid`, escape the group, and survive. Use a purpose-built OS sandbox or
+container when executing hostile code.
 
 The v1 defaults reduce accidental exposure and resource exhaustion:
 
@@ -36,10 +38,15 @@ library transports them; callers own redaction, storage, retention, and safe
 rendering. Tracing must not record argument values, inherited environment
 values, or captured output by default.
 
-Lifecycle errors retain aggregate evidence from termination, reap, and bounded
-capture cleanup. Security-sensitive callers should inspect the whole typed
-result instead of treating a timeout or cancellation label as proof that every
-descendant was contained.
+Lifecycle errors retain one aggregate evidence object containing typed signal
+and reap outcomes, both capture reports, recoverable elapsed time, and the
+typed cleanup outcome. Incomplete capture means EOF was not observed, whether
+because reading failed or the cleanup deadline expired. A
+`CleanupOutcome::Incomplete` value specifically means that deadline expired
+without proof of full settlement; `Unknown` means an adapter could not recover
+the evidence. Security-sensitive callers should inspect the whole typed result
+instead of treating timeout or cancellation as proof that every descendant was
+contained.
 
 ## In scope
 

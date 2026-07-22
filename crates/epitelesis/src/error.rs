@@ -1,11 +1,11 @@
-//! Typed errors and secondary cleanup evidence.
+//! Typed errors and aggregate cleanup evidence.
 
 use std::io::ErrorKind;
 use std::time::Duration;
 
 use snafu::Snafu;
 
-use crate::output::{CapturedStream, Output, StreamName};
+use crate::output::{LifecycleEvidence, StreamName};
 use crate::policy::PolicyViolation;
 
 /// Capability required for the crate's lifecycle guarantee.
@@ -16,7 +16,7 @@ pub enum Capability {
     OwnedProcessGroup,
 }
 
-/// Stable, owned representation of a secondary operating-system failure.
+/// Stable, owned representation of an operating-system failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailureEvidence {
     /// Cleanup or lifecycle operation that failed.
@@ -37,10 +37,10 @@ impl FailureEvidence {
     }
 }
 
-/// Failure reported by a capture worker.
+/// Failure while pumping a capture pipe in the supervisor event loop.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum CaptureWorkerFailure {
+pub enum CaptureFailure {
     /// Reading the pipe returned an I/O error.
     Read {
         /// Portable error category.
@@ -48,43 +48,23 @@ pub enum CaptureWorkerFailure {
         /// I/O error text.
         message: String,
     },
-    /// The worker panicked; the panic was contained and typed.
-    Panicked,
+    /// Retaining captured bytes failed because storage could not grow.
+    ///
+    /// This variant deliberately carries no allocated message so reporting an
+    /// allocation failure cannot itself require another allocation.
+    Allocation,
 }
 
-/// Deterministic report for one capture worker.
-#[derive(Debug, Eq, PartialEq)]
-pub struct CaptureReport {
-    /// Stream this report describes.
-    pub stream: StreamName,
-    /// Prefix and completeness evidence retained before completion or failure.
-    pub captured: CapturedStream,
-    /// Worker failure, or `None` when capture completed normally.
-    pub failure: Option<CaptureWorkerFailure>,
-}
-
-/// Evidence that bounded cleanup could not prove all capture workers finished.
+/// Evidence that the shared cleanup deadline expired before full settlement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupIncompleteEvidence {
-    /// Streams whose pipe never reached a terminal worker result.
+    /// Streams whose pipes did not reach EOF.
     pub unfinished_streams: Vec<StreamName>,
+    /// Whether the leader was unsettled when the cleanup budget expired and
+    /// background-reaper transfer began.
+    pub leader_unsettled: bool,
     /// Shared cleanup budget that elapsed.
     pub cleanup_budget: Duration,
-}
-
-/// Secondary failures retained without replacing the primary outcome.
-#[derive(Debug, Default)]
-pub struct SecondaryErrors {
-    /// Failure while signaling the owned process group.
-    pub signal: Option<FailureEvidence>,
-    /// Failure while reaping the leader.
-    pub reap: Option<FailureEvidence>,
-    /// Stdout worker report when it failed.
-    pub stdout_capture: Option<CaptureWorkerFailure>,
-    /// Stderr worker report when it failed.
-    pub stderr_capture: Option<CaptureWorkerFailure>,
-    /// Evidence that an escaped pipe owner defeated bounded cleanup.
-    pub cleanup: Option<CleanupIncompleteEvidence>,
 }
 
 /// Errors produced by Epitelesis.
@@ -124,119 +104,129 @@ pub enum Error {
         location: snafu::Location,
     },
 
-    /// The leader exited non-zero; this variant owns the sole output payload.
-    #[snafu(display("{program} exited with non-zero status {}", output.status))]
+    /// A supervisor thread could not be created before process creation.
+    #[snafu(display("failed to start supervisor for {program}: {source}"))]
+    SupervisorStartFailed {
+        /// Display form of the program.
+        program: String,
+        /// Underlying thread creation error.
+        source: std::io::Error,
+        /// Error creation location.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The fallback reaper thread could not be created before process creation.
+    #[snafu(display("failed to start fallback reaper for {program}: {source}"))]
+    ReaperStartFailed {
+        /// Display form of the program.
+        program: String,
+        /// Underlying thread creation error.
+        source: std::io::Error,
+        /// Error creation location.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// The leader exited non-zero.
+    #[snafu(display("{program} exited with a non-zero status"))]
     NonZeroExit {
         /// Display form of the program.
         program: String,
-        /// Sole captured output and status payload.
-        output: Output,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// The declared deadline won the serialized outcome race.
-    #[snafu(display("{program} timed out after {duration:?}"))]
+    /// The declared deadline won the serialized outcome decision.
+    #[snafu(display("{program} exceeded its configured deadline of {deadline:?}"))]
     Timeout {
         /// Display form of the program.
         program: String,
-        /// Declared lifetime.
-        duration: Duration,
-        /// Stdout evidence retained before cleanup settled.
-        stdout: CapturedStream,
-        /// Stderr evidence retained before cleanup settled.
-        stderr: CapturedStream,
-        /// Secondary signal, reap, capture, or cleanup failures.
-        secondary: SecondaryErrors,
+        /// Configured lifetime; recovered elapsed time is retained in `evidence`.
+        deadline: Duration,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// A fail-closed capture limit won the serialized outcome race.
+    /// A fail-closed capture limit won the serialized outcome decision.
     #[snafu(display("{program} exceeded the {stream:?} capture limit of {limit} bytes"))]
     CaptureLimitExceeded {
         /// Display form of the program.
         program: String,
-        /// Stream whose limit was exceeded first by deterministic precedence.
+        /// Stream selected by deterministic stdout-first precedence.
         stream: StreamName,
         /// Declared byte bound.
         limit: usize,
-        /// Stdout evidence retained before cleanup settled.
-        stdout: CapturedStream,
-        /// Stderr evidence retained before cleanup settled.
-        stderr: CapturedStream,
-        /// Secondary cleanup evidence.
-        secondary: SecondaryErrors,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// Explicit cancellation won the serialized outcome race.
+    /// Explicit cancellation won the serialized outcome decision.
     #[snafu(display("{program} was cancelled"))]
     Cancelled {
         /// Display form of the program.
         program: String,
-        /// Stdout evidence retained before cleanup settled.
-        stdout: CapturedStream,
-        /// Stderr evidence retained before cleanup settled.
-        stderr: CapturedStream,
-        /// Secondary cleanup evidence.
-        secondary: SecondaryErrors,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// One or both capture workers failed after both outcomes were resolved.
+    /// One or both capture streams failed.
     #[snafu(display("capture failed while executing {program}"))]
     CaptureFailed {
         /// Display form of the program.
         program: String,
-        /// Stdout report, always first.
-        stdout: CaptureReport,
-        /// Stderr report, always second.
-        stderr: CaptureReport,
-        /// Secondary cleanup evidence.
-        secondary: SecondaryErrors,
+        /// Sole aggregate evidence payload with stdout before stderr.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// The supervisor could not observe or wait for the child leader.
+    /// The supervisor could not observe the child leader or poll its pipes.
     #[snafu(display("failed while supervising {program}: {source}"))]
     SupervisionFailed {
         /// Display form of the program.
         program: String,
         /// Underlying observation error.
         source: std::io::Error,
-        /// Stdout retained before supervision failed.
-        stdout: CapturedStream,
-        /// Stderr retained before supervision failed.
-        stderr: CapturedStream,
-        /// Secondary cleanup evidence.
-        secondary: SecondaryErrors,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    /// An escaped descendant retained a pipe beyond the shared cleanup bound.
+    /// Signaling or reaping failed after another lifecycle event settled.
+    #[snafu(display("lifecycle cleanup failed while executing {program}"))]
+    LifecycleFailed {
+        /// Display form of the program.
+        program: String,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
+        /// Error creation location.
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    /// Cleanup did not settle every lifecycle fact within the shared budget.
     #[snafu(display("cleanup incomplete while executing {program}"))]
     CleanupIncomplete {
         /// Display form of the program.
         program: String,
-        /// Stdout evidence retained before returning.
-        stdout: CapturedStream,
-        /// Stderr evidence retained before returning.
-        stderr: CapturedStream,
-        /// Exact streams and budget that remained incomplete.
-        evidence: CleanupIncompleteEvidence,
-        /// Other cleanup failures.
-        secondary: SecondaryErrors,
+        /// Sole aggregate evidence payload.
+        evidence: Box<LifecycleEvidence>,
         /// Error creation location.
         #[snafu(implicit)]
         location: snafu::Location,

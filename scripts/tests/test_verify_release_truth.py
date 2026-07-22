@@ -57,6 +57,10 @@ class ReleaseTruthTests(unittest.TestCase):
             "Cargo.toml",
             f'[workspace]\n[workspace.package]\nversion = "{version}"\n',
         )
+        self._write(
+            "Cargo.lock",
+            f'version = 4\n\n[[package]]\nname = "epitelesis"\nversion = "{version}"\n',
+        )
         self._write(".release-please-manifest.json", f'{{".":"{version}"}}\n')
         self._write(
             "README.md",
@@ -93,7 +97,7 @@ class ReleaseTruthTests(unittest.TestCase):
         self._write_all("1.0.0")
         self._write("Cargo.toml", '[workspace]\n[workspace.package]\nversion = "0.2.0"\n')
         self._commit("incomplete prospective release")
-        with self.assertRaisesRegex(verifier.VerificationError, "all four release facts"):
+        with self.assertRaisesRegex(verifier.VerificationError, "all five release facts"):
             verifier.verify(self.root, prospective=True, base=self.base)
 
     def test_misalignment_fails(self) -> None:
@@ -103,6 +107,77 @@ class ReleaseTruthTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(verifier.VerificationError, "misaligned"):
             verifier.verify(self.root)
+
+    def test_missing_lock_fails(self) -> None:
+        (self.root / "Cargo.lock").unlink()
+        with self.assertRaisesRegex(verifier.VerificationError, "Cargo.lock"):
+            verifier.verify(self.root)
+
+    def test_duplicate_or_malformed_local_lock_package_fails(self) -> None:
+        package = '[[package]]\nname = "epitelesis"\nversion = "0.2.0"\n'
+        self._write("Cargo.lock", f"version = 4\n\n{package}\n{package}")
+        with self.assertRaisesRegex(verifier.VerificationError, "exactly one"):
+            verifier.verify(self.root)
+
+        self._write(
+            "Cargo.lock",
+            'version = 4\n\n[[package]]\nname = "epitelesis"\nversion = [\n',
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "could not read"):
+            verifier.verify(self.root)
+
+    def test_duplicate_and_malformed_markers_fail(self) -> None:
+        self._write(
+            "README.md",
+            'tag = "v0.2.0" # x-release-please-version\n'
+            'again = "v0.2.0" # x-release-please-version\n',
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "exactly one"):
+            verifier.verify(self.root)
+
+        self._write(
+            "README.md",
+            'tag = "not-semver" # x-release-please-version\n',
+        )
+        with self.assertRaisesRegex(verifier.VerificationError, "version token"):
+            verifier.verify(self.root)
+
+    def test_ordinary_tag_must_be_ancestor_of_head(self) -> None:
+        self._git("switch", "-c", "unrelated-tag", self.base)
+        self._write_all("1.0.0")
+        self._commit("unrelated tagged release")
+        self._git("tag", "v1.0.0")
+        self._git("switch", "main")
+        self._write_all("1.0.0")
+        self._commit("different main release fact")
+        with self.assertRaisesRegex(verifier.VerificationError, "ancestor"):
+            verifier.verify(self.root)
+
+    def test_prospective_base_must_be_ancestor_of_head(self) -> None:
+        self._git("switch", "-c", "unrelated-base", self.base)
+        self._write("unrelated.txt", "side branch\n")
+        unrelated = self._commit("unrelated empty base")
+        self._git("switch", "main")
+        self._write_all("1.0.0")
+        self._commit("prospective main release")
+        with self.assertRaisesRegex(verifier.VerificationError, "prospective base"):
+            verifier.verify(self.root, prospective=True, base=unrelated)
+
+    def test_same_version_prospective_update_fails(self) -> None:
+        self._write("Cargo.toml", (self.root / "Cargo.toml").read_text() + "# changed\n")
+        self._write("Cargo.lock", (self.root / "Cargo.lock").read_text() + "# changed\n")
+        self._write(
+            ".release-please-manifest.json",
+            '{\n  ".": "0.2.0"\n}\n',
+        )
+        self._write("README.md", (self.root / "README.md").read_text() + "prose\n")
+        self._write(
+            "_llm/current_state.toml",
+            (self.root / "_llm/current_state.toml").read_text() + "# changed\n",
+        )
+        self._commit("same version prospective update")
+        with self.assertRaisesRegex(verifier.VerificationError, "must differ"):
+            verifier.verify(self.root, prospective=True, base=self.base)
 
 
 if __name__ == "__main__":

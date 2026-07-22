@@ -6,10 +6,15 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::error::{InvalidPolicySnafu, Result};
-use crate::output::StreamName;
 
 /// Conservative capture bound applied independently to stdout and stderr.
 pub const DEFAULT_CAPTURE_LIMIT: usize = 10 * 1024 * 1024;
+
+/// Documented allowance for hard-bounded cleanup after a terminal trigger.
+///
+/// The supervisor's two-second cleanup deadline plus one event-loop quantum
+/// and scheduling margin fit within this caller-visible allowance.
+pub const CLEANUP_ALLOWANCE: Duration = Duration::from_millis(2_100);
 
 /// Marker for a command whose lifecycle policy has not yet been declared.
 #[derive(Debug)]
@@ -75,10 +80,16 @@ pub enum ExecutionPolicy {
 }
 
 impl ExecutionPolicy {
-    pub(crate) fn deadline(&self, started: Instant) -> Option<Instant> {
+    pub(crate) fn deadline(&self, started: Instant) -> Result<Option<Instant>> {
         match self {
-            Self::Deadline(duration) => started.checked_add(*duration),
-            Self::Unbounded(_) => None,
+            Self::Deadline(duration) => match started.checked_add(*duration) {
+                Some(deadline) => Ok(Some(deadline)),
+                None => InvalidPolicySnafu {
+                    violation: PolicyViolation::DeadlineOverflow(*duration),
+                }
+                .fail(),
+            },
+            Self::Unbounded(_) => Ok(None),
         }
     }
 
@@ -200,10 +211,6 @@ impl CapturePolicy {
     pub fn unbounded(reason: impl Into<String>) -> Result<Self> {
         NonEmptyReason::new(reason).map(Self::Unbounded)
     }
-
-    pub(crate) fn is_unbounded(&self) -> bool {
-        matches!(self, Self::Unbounded(_))
-    }
 }
 
 impl Default for CapturePolicy {
@@ -224,8 +231,6 @@ pub enum PolicyViolation {
     BareProgramWithoutPath(OsString),
     /// The process identifier could not be represented safely by the backend.
     InvalidProcessId(u32),
-    /// Managed streaming does not use a supervisor-owned capture buffer.
-    UnboundedCaptureForManaged(StreamName),
 }
 
 impl fmt::Display for PolicyViolation {
@@ -243,10 +248,6 @@ impl fmt::Display for PolicyViolation {
                 "bare program {program:?} requires PATH to be explicitly set or allowlisted"
             ),
             Self::InvalidProcessId(id) => write!(f, "process id {id} is not representable"),
-            Self::UnboundedCaptureForManaged(stream) => write!(
-                f,
-                "unbounded {stream:?} capture is unavailable for managed streaming"
-            ),
         }
     }
 }

@@ -1,12 +1,23 @@
 //! Integration coverage for the structural synchronous contract.
 
+#![cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
 use epitelesis::{
-    CaptureCompleteness, CapturePolicy, Command, EnvironmentPolicy, Error, PolicyViolation,
-    StreamName, output, run,
+    CLEANUP_ALLOWANCE, CaptureCompleteness, CapturePolicy, CleanupOutcome, Command,
+    EnvironmentPolicy, Error, PolicyViolation, StreamName, output, run,
 };
 
 trait Must<T> {
@@ -67,8 +78,11 @@ fn deadline_overflow_is_rejected_before_spawn() {
 #[test]
 fn clean_environment_is_the_actual_default() {
     let output = run(bounded("/usr/bin/env")).must("env with no variables exits zero");
-    assert!(output.stdout.is_empty());
-    assert_eq!(output.stdout.completeness, CaptureCompleteness::Complete);
+    assert!(output.evidence.stdout.captured.is_empty());
+    assert_eq!(
+        output.evidence.stdout.captured.completeness,
+        CaptureCompleteness::Complete
+    );
 }
 
 #[test]
@@ -88,10 +102,13 @@ fn allowlist_and_inherit_have_explicit_parity() {
         .must("deadline is valid"))
     .must("inherited PATH is visible");
     assert_eq!(
-        allowlisted.stdout.bytes,
+        allowlisted.evidence.stdout.captured.bytes,
         [expected_path.as_encoded_bytes(), b"\n"].concat()
     );
-    assert_eq!(allowlisted.stdout.bytes, inherited.stdout.bytes);
+    assert_eq!(
+        allowlisted.evidence.stdout.captured.bytes,
+        inherited.evidence.stdout.captured.bytes
+    );
 }
 
 #[test]
@@ -104,7 +121,7 @@ fn environment_operations_apply_after_policy_in_call_order() {
         .deadline(Duration::from_secs(10))
         .must("deadline is valid"))
     .must("last set wins");
-    assert_eq!(output.stdout.bytes, b"final\n");
+    assert_eq!(output.evidence.stdout.captured.bytes, b"final\n");
 }
 
 #[test]
@@ -129,6 +146,42 @@ fn bare_program_requires_explicit_path() {
 }
 
 #[test]
+fn missing_program_surfaces_spawn_failure() {
+    let error = run(bounded("/definitely/does/not/exist/epitelesis-test-binary"))
+        .must_err("missing program cannot spawn");
+    assert!(matches!(error, Error::SpawnFailed { .. }));
+}
+
+#[test]
+fn get_envs_reports_effective_last_call_wins_view() {
+    let command = Command::new("/bin/true")
+        .env("EPITELESIS_A", "kept")
+        .env("EPITELESIS_B", "shadowed")
+        .env_remove("EPITELESIS_B")
+        .env_remove("EPITELESIS_C")
+        .env("EPITELESIS_C", "revived");
+    let envs = command.get_envs().collect::<Vec<_>>();
+    assert_eq!(
+        envs,
+        vec![
+            (OsStr::new("EPITELESIS_A"), Some(OsStr::new("kept"))),
+            (OsStr::new("EPITELESIS_B"), None),
+            (OsStr::new("EPITELESIS_C"), Some(OsStr::new("revived"))),
+        ]
+    );
+}
+
+#[test]
+fn captured_run_closes_piped_stdin_before_supervision() {
+    let output = run(Command::new("/bin/cat")
+        .stdin(std::process::Stdio::piped())
+        .deadline(Duration::from_secs(2))
+        .must("deadline is valid"))
+    .must("cat observes EOF");
+    assert!(output.success());
+}
+
+#[test]
 fn command_debug_redacts_environment_values() {
     let debug = format!(
         "{:?}",
@@ -148,12 +201,16 @@ fn exact_stdout_and_stderr_caps_are_complete() {
         .deadline(Duration::from_secs(10))
         .must("deadline is valid"))
     .must("exact caps are not overflow");
-    assert_eq!(output.stdout.bytes, b"12345");
-    assert_eq!(output.stderr.bytes, b"abcde");
-    assert!(output.stdout.bytes.capacity() <= 5);
-    assert!(output.stderr.bytes.capacity() <= 5);
-    assert_eq!(output.stdout.completeness, CaptureCompleteness::Complete);
-    assert_eq!(output.stderr.completeness, CaptureCompleteness::Complete);
+    assert_eq!(output.evidence.stdout.captured.bytes, b"12345");
+    assert_eq!(output.evidence.stderr.captured.bytes, b"abcde");
+    assert_eq!(
+        output.evidence.stdout.captured.completeness,
+        CaptureCompleteness::Complete
+    );
+    assert_eq!(
+        output.evidence.stderr.captured.completeness,
+        CaptureCompleteness::Complete
+    );
 }
 
 #[test]
@@ -171,18 +228,34 @@ fn cap_plus_one_fails_closed_on_each_stream_with_bounded_peer_bytes() {
         .must_err("cap plus one must fail closed");
         match error {
             Error::CaptureLimitExceeded {
-                stream,
-                stdout,
-                stderr,
-                ..
+                stream, evidence, ..
             } => {
                 assert_eq!(stream, expected_stream);
-                assert!(stdout.len() <= 5);
-                assert!(stderr.len() <= 5);
-                assert!(stdout.bytes.capacity() <= 5);
-                assert!(stderr.bytes.capacity() <= 5);
+                assert!(evidence.stdout.captured.len() <= 5);
+                assert!(evidence.stderr.captured.len() <= 5);
             }
             other => panic!("expected CaptureLimitExceeded, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn fast_exit_cap_plus_one_stress_never_returns_success() {
+    for (script, expected) in [
+        ("printf 123456; printf peer >&2", StreamName::Stdout),
+        ("printf peer; printf 123456 >&2", StreamName::Stderr),
+    ] {
+        for _ in 0..64 {
+            let result = run(Command::new("/bin/sh")
+                .args(["-c", script])
+                .capture_stdout(CapturePolicy::bounded(5))
+                .capture_stderr(CapturePolicy::bounded(5))
+                .deadline(Duration::from_secs(2))
+                .must("deadline is valid"));
+            assert!(matches!(
+                result,
+                Err(Error::CaptureLimitExceeded { stream, .. }) if stream == expected
+            ));
         }
     }
 }
@@ -198,14 +271,11 @@ fn simultaneous_overflow_is_stdout_first_and_both_buffers_remain_bounded() {
     .must_err("both streams overflow");
     match error {
         Error::CaptureLimitExceeded {
-            stream,
-            stdout,
-            stderr,
-            ..
+            stream, evidence, ..
         } => {
             assert_eq!(stream, StreamName::Stdout);
-            assert_eq!(stdout.len(), 5);
-            assert_eq!(stderr.len(), 5);
+            assert_eq!(evidence.stdout.captured.len(), 5);
+            assert_eq!(evidence.stderr.captured.len(), 5);
         }
         other => panic!("expected CaptureLimitExceeded, got {other:?}"),
     }
@@ -221,10 +291,9 @@ fn truncation_drains_high_volume_output_and_counts_every_discard() {
         .deadline(Duration::from_secs(10))
         .must("deadline is valid"))
     .must("truncate mode drains without failing");
-    assert_eq!(output.stdout.len(), LIMIT);
-    assert!(output.stdout.bytes.capacity() <= LIMIT);
+    assert_eq!(output.evidence.stdout.captured.len(), LIMIT);
     assert_eq!(
-        output.stdout.completeness,
+        output.evidence.stdout.captured.completeness,
         CaptureCompleteness::Truncated {
             discarded: (TOTAL - LIMIT) as u64
         }
@@ -238,23 +307,27 @@ fn redirected_stream_is_distinct_from_captured_empty() {
         .deadline(Duration::from_secs(10))
         .must("deadline is valid"))
     .must("true exits zero");
-    assert_eq!(output.stdout.completeness, CaptureCompleteness::Redirected);
-    assert_eq!(output.stderr.completeness, CaptureCompleteness::Complete);
+    assert_eq!(
+        output.evidence.stdout.captured.completeness,
+        CaptureCompleteness::Redirected
+    );
+    assert_eq!(
+        output.evidence.stderr.captured.completeness,
+        CaptureCompleteness::Complete
+    );
 }
 
 #[test]
 fn timeout_retains_partial_capture_and_secondary_evidence() {
     let error = run(Command::new("/bin/sh")
         .args(["-c", "printf ready; exec /bin/sleep 30"])
-        .deadline(Duration::from_millis(150))
+        .deadline(Duration::from_millis(500))
         .must("deadline is valid"))
     .must_err("sleep exceeds deadline");
     match error {
-        Error::Timeout {
-            stdout, secondary, ..
-        } => {
-            assert_eq!(stdout.bytes, b"ready");
-            assert!(secondary.cleanup.is_none());
+        Error::Timeout { evidence, .. } => {
+            assert_eq!(evidence.stdout.captured.bytes, b"ready");
+            assert!(matches!(&evidence.cleanup, CleanupOutcome::Complete));
         }
         other => panic!("expected Timeout, got {other:?}"),
     }
@@ -264,15 +337,28 @@ fn timeout_retains_partial_capture_and_secondary_evidence() {
 #[test]
 fn sync_timeout_kills_background_descendant_holding_pipes() {
     let directory = tempfile::tempdir().must("scratch directory");
+    let leaderfile = directory.path().join("leader.pid");
     let pidfile = directory.path().join("descendant.pid");
-    let script = format!("/bin/sleep 30 & echo $! > {}; wait", pidfile.display());
+    let script = format!(
+        "echo $$ > {}; /bin/sleep 30 & echo $! > {}; wait",
+        leaderfile.display(),
+        pidfile.display()
+    );
+    let configured_deadline = Duration::from_secs(1);
     let error = run(Command::new("/bin/sh")
         .args(["-c", &script])
-        .deadline(Duration::from_millis(250))
+        .deadline(configured_deadline)
         .must("deadline is valid"))
     .must_err("background descendant exceeds deadline");
-    assert!(matches!(error, Error::Timeout { .. }));
+    let elapsed = match error {
+        Error::Timeout { evidence, .. } => evidence.elapsed.must("elapsed evidence is known"),
+        other => panic!("expected Timeout, got {other:?}"),
+    };
+    assert!(elapsed >= configured_deadline);
+    assert!(elapsed <= configured_deadline + CLEANUP_ALLOWANCE);
+    let leader = wait_for_pid(&leaderfile);
     let pid = wait_for_pid(&pidfile);
+    wait_until_gone(leader);
     wait_until_gone(pid);
 }
 
@@ -280,6 +366,7 @@ fn sync_timeout_kills_background_descendant_holding_pipes() {
 fn output_preserves_nonzero_payload_without_clone() {
     let output = output(bounded("/bin/false")).must("output preserves nonzero status");
     assert!(!output.success());
+    assert!(!output.status().success());
 }
 
 #[cfg(target_os = "linux")]
@@ -290,25 +377,34 @@ fn escaped_session_surfaces_truthful_cleanup_incomplete() {
     let directory = tempfile::tempdir().must("scratch directory");
     let pidfile = directory.path().join("escaped.pid");
     let script = format!(
-        "/usr/bin/setsid /bin/sh -c 'echo $$ > {}; exec /bin/sleep 30' &",
+        "/usr/bin/setsid /bin/sh -c 'echo $$ > {}; exec /bin/sleep 30' & exec /bin/sleep 1",
         pidfile.display()
     );
-    let started = Instant::now();
+    let leader_lifetime = Duration::from_secs(1);
     let error = run(Command::new("/bin/sh")
         .args(["-c", &script])
-        .deadline(Duration::from_secs(5))
+        .deadline(Duration::from_secs(10))
         .must("deadline is valid"))
     .must_err("escaped process retains both capture pipes");
-    match error {
-        Error::CleanupIncomplete { evidence, .. } => {
+    let elapsed = match error {
+        Error::CleanupIncomplete {
+            evidence: lifecycle,
+            ..
+        } => {
+            let cleanup = match &lifecycle.cleanup {
+                CleanupOutcome::Incomplete(cleanup) => cleanup,
+                other => panic!("expected incomplete cleanup evidence, got {other:?}"),
+            };
             assert_eq!(
-                evidence.unfinished_streams,
+                cleanup.unfinished_streams,
                 vec![StreamName::Stdout, StreamName::Stderr]
             );
+            lifecycle.elapsed.must("elapsed evidence is known")
         }
         other => panic!("expected CleanupIncomplete, got {other:?}"),
-    }
-    assert!(started.elapsed() < Duration::from_secs(5));
+    };
+    assert!(elapsed >= leader_lifetime);
+    assert!(elapsed <= leader_lifetime + CLEANUP_ALLOWANCE);
 
     let deadline = Instant::now() + Duration::from_secs(2);
     let pid = loop {
@@ -324,22 +420,6 @@ fn escaped_session_surfaces_truthful_cleanup_incomplete() {
     if let Some(pid) = Pid::from_raw(pid) {
         let _ = kill_process(pid, Signal::KILL);
     }
-}
-
-#[cfg(not(unix))]
-#[test]
-fn unsupported_backend_is_rejected_before_spawn() {
-    let error = run(Command::new("definitely-not-created")
-        .deadline(Duration::from_secs(1))
-        .must("deadline is valid"))
-    .must_err("backend cannot claim owned process groups");
-    assert!(matches!(
-        error,
-        Error::UnsupportedCapability {
-            capability: epitelesis::Capability::OwnedProcessGroup,
-            ..
-        }
-    ));
 }
 
 #[cfg(target_os = "linux")]

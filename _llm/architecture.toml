@@ -30,18 +30,18 @@ default_limit_bytes_per_stream = 10485760
 default_limit_behavior = "fail-closed"
 explicit_alternatives = [
   "truncation",
-  "streaming",
   "exceptional unbounded capture with a reason",
+  "managed streaming via a structural command transition",
 ]
 
 [architecture.supervisor]
-ownership = "One supervisor owns spawn through bounded cleanup and final evidence."
+ownership = "One supervisor owns spawn through a fair nonblocking two-pipe poll loop, bounded cleanup, and final evidence."
 unix_termination_order = "Kill the process group before reaping."
-managed_child = "ManagedChild owns deadline, cancellation, and reap."
-evidence = "Exit, termination, reap, and capture-cleanup facts are aggregated."
+managed_child = "ManagedChild owns deadline, cancellation, and reap while the caller owns streaming bytes and backpressure."
+evidence = "Optional leader status, recoverable elapsed time, typed signal/reap outcomes, ordered stream reports, and typed cleanup outcome share one boxed surface."
 
 [architecture.portability]
-non_unix = "Return a typed unsupported result when process-group lifecycle semantics are unavailable."
+unsupported = "Return a typed unsupported result before spawn on non-Unix and rustix-waitid-unsupported Unix targets."
 security_boundary = "A process group is cleanup containment, not a sandbox; a hostile child can call setsid."
 
 [[architecture.interfaces]]

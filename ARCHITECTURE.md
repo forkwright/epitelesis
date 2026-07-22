@@ -10,8 +10,9 @@ one supervisor then owns the process and all evidence until cleanup completes.
 Command typestate
   ├─ deadline: bounded | unbounded(reason)
   ├─ environment: Clean | Allowlist | InheritAll(reason)
-  └─ capture: bounded(10 MiB/stream, fail-closed)
-              | truncate | stream | unbounded(exceptional reason)
+  └─ bytes: capture bounded(10 MiB/stream, fail-closed)
+            | truncate | unbounded(exceptional reason)
+            | streaming() structural transition
                          │
                          ▼
                     supervisor
@@ -33,24 +34,34 @@ Exactly one supervisor owns each running invocation. It owns:
 
 - process creation and observation;
 - deadline and cancellation decisions;
-- stdout and stderr capture under the selected limits;
+- stdout and stderr capture in one fair, nonblocking `poll` loop;
 - termination of the Unix process group before reap;
 - bounded drain and capture cleanup; and
 - construction of a single evidence-bearing result.
 
-Cleanup is part of the result, not best-effort work after it. If termination,
-reap, or capture cleanup also fails, that evidence is aggregated so the first
-failure does not erase later lifecycle facts.
+Each ready pipe receives a bounded byte/chunk turn before control checks resume.
+There are no capture reader threads. Cleanup is part of the result, not
+best-effort work after it. One two-second internal cleanup deadline owns group
+signal, non-reaping leader observation, reap, and pipe settlement. The public
+allowance is 2.1 seconds. If the leader remains unsettled, the supervisor
+attempts to transfer its `Child` to the named background reaper; typed reap
+disposition, failure, and cleanup evidence report whether that transfer
+succeeded. Capture itself never moves to a background worker. The reaper
+endpoint is created fallibly before process spawn, so thread-creation failure
+cannot strand an already-running child.
 
-`ManagedChild` is the supervised handoff for caller-managed operation. It keeps
-deadline, cancellation, and reap ownership together; it is not a detached raw
-child handle.
+`ManagedChild` is the supervised handoff produced only by the explicit
+`Command<Ready>::streaming()` transition. The caller owns pipe bytes and
+backpressure; the supervisor keeps deadline, cancellation, kill-before-reap,
+and bounded cleanup together. `wait` closes retained stdin, typed `poll`
+distinguishes running/success/error, `cancel` returns aggregate evidence only
+after complete cancellation cleanup, and drop waits only the hard allowance.
 
 ## Portability boundary
 
-The full lifecycle contract relies on Unix process groups. Unsupported
-platforms return a typed unsupported result instead of silently weakening kill
-or reap behavior.
+The full lifecycle contract relies on Unix process groups and rustix `waitid`.
+Non-Unix plus `cygwin`, `horizon`, `openbsd`, `redox`, and `wasi` return a typed
+unsupported result before spawn instead of weakening kill or reap behavior.
 
 Killing a process group is operational containment, not adversarial isolation.
 A hostile descendant can call `setsid`, leave the group, and outlive group
@@ -60,17 +71,34 @@ sandbox or container designed for that purpose.
 ## Capture bounds
 
 The default maximum is 10 MiB independently for stdout and stderr. Crossing a
-limit fails closed. Truncation and streaming must be chosen explicitly.
-Exceptional unbounded capture requires a reason and remains the caller's memory
-risk. Capture cleanup itself is bounded so a pipe that never closes cannot make
-the supervisor wait forever after termination.
+limit persists an overflow fact and fails closed even if the leader exits
+immediately. Truncation and exceptional unbounded capture are explicit;
+streaming is a separate command state. Only pipe EOF produces `Complete` or
+`Truncated`. Read failure and cleanup-deadline snapshots produce `Incomplete`.
 
 ## Public contract
 
+Every post-spawn terminal result owns a boxed `LifecycleEvidence` with optional
+leader status, recoverable elapsed time, typed signal and reap outcomes, stdout
+then stderr reports, and a typed complete/incomplete/unknown cleanup outcome.
+Timeout also retains its configured deadline. Deterministic primary precedence
+is stdout limit, stderr limit, cancellation, deadline, capture failure,
+supervision failure, then exit.
+
 The SemVer surface includes typestate transitions, execution entry points,
 environment and capture policy types, `ManagedChild`, output/evidence types,
-typed errors, and Cargo features. Error enums remain non-exhaustive so new
-evidence can be added without encouraging exhaustive downstream matches.
+typed errors, and Cargo features. Error enums remain non-exhaustive.
+
+## Hosted release mechanism
+
+Release truth is the aligned workspace version, local `epitelesis` lockfile
+package, release manifest, README marker, and machine-state marker. Ordinary
+verification requires the selected tag to be an ancestor of `HEAD`.
+Prospective verification requires an authenticated Release Please PR, an
+explicit base ancestor of `HEAD`, the base tag on that ancestry, and all five
+facts changing together. The protected `gate / gate-attestation` context first
+runs that policy, then accepts only an exact prose-only skip or a successful
+hosted full Rust gate.
 
 The synchronous default and additive `async` feature must implement the same
 policy and lifecycle semantics. Async support may add runtime dependencies only
@@ -80,4 +108,6 @@ when that feature is enabled.
 
 Callers own program selection, argument validation, retry policy, redaction,
 and any actual sandbox. Epitelesis owns subprocess policy enforcement,
-lifecycle completion, and the evidence returned from that lifecycle.
+lifecycle completion, and the evidence returned from that lifecycle. Each
+consumer repository owns its manifest, lockfile, and CI dependency truth;
+Epitelesis does not maintain a provider-side cutover ledger.

@@ -19,19 +19,23 @@ typed, and sync/async semantics aligned.
 - Environment defaults to real `Clean`/`env_clear`; `Allowlist` is selective;
   `InheritAll` requires a reason.
 - Capture defaults to 10 MiB independently for stdout and stderr and fails
-  closed at the limit. Truncation, streaming, and exceptional unbounded capture
-  are explicit policies.
+  closed at the limit. Truncation and exceptional unbounded capture are
+  explicit policies; managed streaming requires the structural `streaming()`
+  transition.
 - One supervisor owns process-group termination before reap, bounded capture
   cleanup, and aggregate evidence.
-- `ManagedChild` retains deadline, cancellation, and reap ownership.
-- Unsupported non-Unix lifecycle behavior is a typed result.
+- `ManagedChild` retains deadline, cancellation, and reap ownership while the
+  caller owns streaming bytes and backpressure.
+- Unsupported backends, including Unix targets without rustix `waitid`, return
+  a typed result before spawn.
 - Unix process groups are cleanup containment, not a security sandbox; a
   hostile child can escape with `setsid`.
 
 ## Release truth
 
-The workspace version, release manifest, README dependency marker, and
-`_llm/current_state.toml` marker are one release fact. Run:
+The workspace version, local `epitelesis` version in `Cargo.lock`, release
+manifest, README dependency marker, and `_llm/current_state.toml` marker are
+one release fact. Run:
 
 ```bash
 python3 scripts/verify_release_truth.py
@@ -40,7 +44,7 @@ python3 -m unittest discover -s scripts/tests -v
 
 Ordinary changes require the matching local release tag. Only the dedicated PR
 workflow may select prospective mode, and only for a trusted Release Please PR
-whose four release files changed together from the explicit base commit. Do not
+whose five release files changed together from the explicit base commit. Do not
 duplicate release versions outside the marked lines.
 
 ## Gate

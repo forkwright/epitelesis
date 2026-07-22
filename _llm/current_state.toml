@@ -5,31 +5,38 @@ generated = false
 source_docs = [
   "README.md",
   "Cargo.toml",
+  "Cargo.lock",
   ".release-please-manifest.json",
   "ARCHITECTURE.md",
 ]
 
 [state]
 release_version = "0.2.0" # x-release-please-version
-release_status = "The workspace, manifest, README pin, machine state, and named local tag agree."
-contract_status = "The breaking v1 invocation and supervisor contract is fixed for implementation and release."
+release_status = "The workspace, local lockfile package, manifest, README pin, machine state, and ancestral local tag agree."
+contract_status = "The breaking v1 invocation and supervisor contract is implemented on the convergence branch and awaits exact-head hosted compilation and gate evidence."
 updated = "2026-07-22"
 
 [state.v1_contract]
 deadline = "Typestate requires bounded execution or unbounded execution with a reason."
 environment = "Clean/env_clear by default; Allowlist selective; InheritAll reason-bearing."
-capture = "10 MiB per stream by default, fail-closed; truncation, streaming, and exceptional unbounded are explicit."
-supervision = "One supervisor kills the Unix process group before reap, bounds capture cleanup, and aggregates evidence."
-managed_child = "ManagedChild owns deadline, cancellation, and reap."
-portability = "Unsupported non-Unix lifecycle behavior is typed."
+capture = "10 MiB per stream by default, fail-closed; truncation and exceptional unbounded capture are explicit, while streaming is a structural transition."
+supervision = "One fair nonblocking poll loop owns both capture pipes, kills the Unix process group before reap, and aggregates boxed lifecycle evidence."
+managed_child = "ManagedChild owns deadline, cancellation, and reap; the caller explicitly owns streaming bytes and backpressure."
+portability = "Non-Unix and Unix targets without rustix waitid support return typed unsupported capability before spawn."
 sandbox = "Process groups are not a security sandbox because hostile children can call setsid."
 
 [state.release_verification]
-ordinary = "All four release files must align and the named local tag must exist."
-prospective = "Only the trusted Release Please PR workflow may allow an untagged version, with an explicit base and all four files changed together."
+ordinary = "All five release files must align and the selected local tag must be an ancestor of HEAD."
+prospective = "Only authenticated Release Please policy may allow an untagged version, with an ancestral explicit base and all five files changed together."
 files = [
   "Cargo.toml",
+  "Cargo.lock",
   ".release-please-manifest.json",
   "README.md",
   "_llm/current_state.toml",
 ]
+
+[state.hosted_gate]
+protected_context = "gate / gate-attestation"
+policy = "Release verification runs before fail-closed path classification."
+build = "Only exact prose files skip; every code-affecting change requires the Ubuntu 24.04 full gate."
