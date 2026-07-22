@@ -23,6 +23,14 @@
                     "type": "toml",
                     "path": "Cargo.toml",
                     "jsonpath": "$.workspace.package.version"
+                },
+                {
+                    "type": "generic",
+                    "path": "README.md"
+                },
+                {
+                    "type": "generic",
+                    "path": "_llm/current_state.toml"
                 }
             ]
         }

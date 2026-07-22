@@ -5,23 +5,47 @@ generated = false
 source_docs = [
   "README.md",
   "ARCHITECTURE.md",
-  "Cargo.toml",
+  "SECURITY.md",
 ]
 
 [architecture]
-summary = "Fleet command-execution wrapper substrate: builder, sync runners, optional async runner, typed errors, tracing spans."
+summary = "Typed subprocess invocation policy, single-owner lifecycle supervision, and aggregate execution evidence."
 layers = [
-  "builder",
-  "runner",
-  "error",
+  "command-typestate",
+  "invocation-policy",
+  "supervisor",
+  "evidence",
 ]
 
-[[architecture.crates]]
-name = "epitelesis"
-path = "crates/epitelesis"
-role = "Single crate: Command builder + sync (run/output/status/spawn_child) + optional async (spawn, feature = 'async') + typed Error/Output."
+[architecture.command]
+runnable_precondition = "A bounded deadline or an explicit unbounded deadline with a reason."
+environment_default = "Clean with real env_clear semantics."
+environment_exceptions = [
+  "Allowlist exposes named variables only.",
+  "InheritAll requires a reason.",
+]
 
-[[interfaces]]
+[architecture.capture]
+default_limit_bytes_per_stream = 10485760
+default_limit_behavior = "fail-closed"
+explicit_alternatives = [
+  "truncation",
+  "streaming",
+  "exceptional unbounded capture with a reason",
+]
+
+[architecture.supervisor]
+ownership = "One supervisor owns spawn through bounded cleanup and final evidence."
+unix_termination_order = "Kill the process group before reaping."
+managed_child = "ManagedChild owns deadline, cancellation, and reap."
+evidence = "Exit, termination, reap, and capture-cleanup facts are aggregated."
+
+[architecture.portability]
+non_unix = "Return a typed unsupported result when process-group lifecycle semantics are unavailable."
+security_boundary = "A process group is cleanup containment, not a sandbox; a hostile child can call setsid."
+
+[[architecture.interfaces]]
 name = "epitelesis"
 kind = "rust-library"
 path = "crates/epitelesis"
+features = ["default-sync", "async-additive"]

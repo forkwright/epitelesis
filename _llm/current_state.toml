@@ -4,24 +4,32 @@ repo = "forkwright/epitelesis"
 generated = false
 source_docs = [
   "README.md",
-  "CHANGELOG.md",
+  "Cargo.toml",
+  ".release-please-manifest.json",
+  "ARCHITECTURE.md",
 ]
 
 [state]
-summary = "Initial extraction from forkwright/kanon (D-067 Tier B EXTRACT-NOW). Single crate, sync runners stable, async runner gated by feature."
-current_phase = "Post-extraction stabilisation; consumer cutover via kanon workspace dep rewire (forkwright/kanon PR)."
-updated = "2026-05-28"
+release_version = "0.2.0" # x-release-please-version
+release_status = "The workspace, manifest, README pin, machine state, and named local tag agree."
+contract_status = "The breaking v1 invocation and supervisor contract is fixed for implementation and release."
+updated = "2026-07-22"
 
-[[recent]]
-date = "2026-05-28"
-item = "Extracted from kanon (crates/epitelesis -> forkwright/epitelesis). Initial scaffold + standards + workflows landed."
+[state.v1_contract]
+deadline = "Typestate requires bounded execution or unbounded execution with a reason."
+environment = "Clean/env_clear by default; Allowlist selective; InheritAll reason-bearing."
+capture = "10 MiB per stream by default, fail-closed; truncation, streaming, and exceptional unbounded are explicit."
+supervision = "One supervisor kills the Unix process group before reap, bounds capture cleanup, and aggregates evidence."
+managed_child = "ManagedChild owns deadline, cancellation, and reap."
+portability = "Unsupported non-Unix lifecycle behavior is typed."
+sandbox = "Process groups are not a security sandbox because hostile children can call setsid."
 
-[[open_threads]]
-name = "kanon consumer cutover"
-issue = 0
-status = "Coordinated forkwright/kanon PR drops crates/epitelesis from the workspace and rewires the workspace dep as git = forkwright/epitelesis. Merges after this repo's #1."
-
-[[open_threads]]
-name = "v0.1.0 release tag"
-issue = 0
-status = "release-please opens the first release PR after #1 lands; tag v0.1.0 becomes the pin target for kanon."
+[state.release_verification]
+ordinary = "All four release files must align and the named local tag must exist."
+prospective = "Only the trusted Release Please PR workflow may allow an untagged version, with an explicit base and all four files changed together."
+files = [
+  "Cargo.toml",
+  ".release-please-manifest.json",
+  "README.md",
+  "_llm/current_state.toml",
+]

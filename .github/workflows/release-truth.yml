@@ -1,0 +1,28 @@
+name: Release Truth
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify trusted prospective release truth
+        if: ${{ startsWith(github.head_ref, 'release-please--branches--') && (github.event.pull_request.user.login == 'github-actions[bot]' || github.event.pull_request.user.login == 'release-please[bot]') }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/verify_release_truth.py --prospective --base "$BASE_SHA"
+
+      - name: Verify tagged release truth
+        if: ${{ !startsWith(github.head_ref, 'release-please--branches--') || (github.event.pull_request.user.login != 'github-actions[bot]' && github.event.pull_request.user.login != 'release-please[bot]') }}
+        run: python3 scripts/verify_release_truth.py
