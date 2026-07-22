@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use epitelesis::{
     CLEANUP_ALLOWANCE, CaptureCompleteness, CapturePolicy, CleanupOutcome, Command,
-    EnvironmentPolicy, Error, PolicyViolation, StreamName, output, run,
+    DEFAULT_CAPTURE_LIMIT, EnvironmentPolicy, Error, PolicyViolation, StreamName, output, run,
 };
 
 trait Must<T> {
@@ -143,6 +143,39 @@ fn bare_program_requires_explicit_path() {
         .deadline(Duration::from_secs(1))
         .must("deadline is valid"))
     .must("explicit PATH permits bare lookup");
+}
+
+#[test]
+fn streaming_rejects_non_default_capture_policies() {
+    let stdout_error = bounded("/bin/true")
+        .capture_stdout(CapturePolicy::bounded(1))
+        .streaming()
+        .must_err("custom stdout capture cannot become streaming");
+    assert!(matches!(
+        stdout_error,
+        Error::InvalidPolicy {
+            violation: PolicyViolation::CapturePolicyWithStreaming(StreamName::Stdout),
+            ..
+        }
+    ));
+
+    let stderr_error = bounded("/bin/true")
+        .capture_stderr(CapturePolicy::truncate(DEFAULT_CAPTURE_LIMIT))
+        .streaming()
+        .must_err("custom stderr overflow behavior cannot become streaming");
+    assert!(matches!(
+        stderr_error,
+        Error::InvalidPolicy {
+            violation: PolicyViolation::CapturePolicyWithStreaming(StreamName::Stderr),
+            ..
+        }
+    ));
+
+    let _streaming = bounded("/bin/true")
+        .capture_stdout(CapturePolicy::default())
+        .capture_stderr(CapturePolicy::default())
+        .streaming()
+        .must("explicit default capture policies may become streaming");
 }
 
 #[test]

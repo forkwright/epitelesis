@@ -6,6 +6,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::error::{InvalidPolicySnafu, Result};
+use crate::output::StreamName;
 
 /// Conservative capture bound applied independently to stdout and stderr.
 pub const DEFAULT_CAPTURE_LIMIT: usize = 10 * 1024 * 1024;
@@ -211,6 +212,16 @@ impl CapturePolicy {
     pub fn unbounded(reason: impl Into<String>) -> Result<Self> {
         NonEmptyReason::new(reason).map(Self::Unbounded)
     }
+
+    pub(crate) fn is_default(&self) -> bool {
+        matches!(
+            self,
+            Self::Bounded {
+                limit: DEFAULT_CAPTURE_LIMIT,
+                overflow: OverflowBehavior::FailClosed,
+            }
+        )
+    }
 }
 
 impl Default for CapturePolicy {
@@ -229,8 +240,8 @@ pub enum PolicyViolation {
     DeadlineOverflow(Duration),
     /// PATH lookup was requested without making PATH visible to the child.
     BareProgramWithoutPath(OsString),
-    /// The process identifier could not be represented safely by the backend.
-    InvalidProcessId(u32),
+    /// A non-default capture policy was combined with managed streaming.
+    CapturePolicyWithStreaming(StreamName),
 }
 
 impl fmt::Display for PolicyViolation {
@@ -247,7 +258,10 @@ impl fmt::Display for PolicyViolation {
                 f,
                 "bare program {program:?} requires PATH to be explicitly set or allowlisted"
             ),
-            Self::InvalidProcessId(id) => write!(f, "process id {id} is not representable"),
+            Self::CapturePolicyWithStreaming(stream) => write!(
+                f,
+                "non-default {stream:?} capture policy cannot be combined with managed streaming"
+            ),
         }
     }
 }

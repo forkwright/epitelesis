@@ -37,8 +37,9 @@ Environment policy is also explicit and fail-closed:
 Captured stdout and stderr each default to a 10 MiB limit. Crossing either
 limit fails closed. A caller may instead choose explicit truncation or
 exceptional unbounded capture; unbounded capture requires justification.
-Managed streaming is a different structural state created with
-`command.streaming()`, so default capture cannot be silently ignored.
+Managed streaming is a different structural state created with the fallible
+`command.streaming()?` transition. It rejects non-default capture policies so
+non-default capture behavior cannot be silently discarded.
 
 ## Lifecycle ownership
 
@@ -54,13 +55,13 @@ creation, so its startup cannot strand a running child.
 
 `ManagedChild` retains ownership of deadline handling, cancellation, and reap
 for caller-managed execution. Construct it only from `Command<Ready>` via
-`.streaming().spawn()` (or `spawn_managed(command.streaming())`). The caller
+`.streaming()?.spawn()` (or `spawn_managed(command.streaming()?)`). The caller
 owns bytes and backpressure after taking a pipe handle. `wait` closes retained
 stdin first, `poll` distinguishes running, successful, and failed terminal
 states without blocking, and `cancel` returns aggregate evidence only after
-complete cancellation cleanup. Drop requests cancellation and waits no longer
-than the documented cleanup allowance. If scheduling exhausts that allowance,
-the detached supervisor retains lifecycle ownership until it finishes.
+complete cancellation cleanup. Drop requests cancellation without blocking;
+the detached supervisor retains lifecycle ownership through bounded cleanup
+and any required background-reaper handoff.
 
 Platforms without the required process-group lifecycle return a typed
 unsupported error before spawn. This includes non-Unix platforms and Unix

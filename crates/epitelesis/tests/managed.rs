@@ -46,7 +46,8 @@ fn managed_child_streams_and_waits() {
             .args(["-c", "printf managed"])
             .deadline(Duration::from_secs(5))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("managed child spawns");
     let mut stdout = child.take_stdout().must("stdout is piped");
@@ -69,7 +70,8 @@ fn managed_cancel_kills_background_descendant() {
             .args(["-c", &script])
             .deadline(Duration::from_secs(30))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("managed child spawns");
     let pid = wait_for_pid(&pidfile);
@@ -88,7 +90,8 @@ fn managed_drop_kills_background_descendant() {
             .args(["-c", &script])
             .deadline(Duration::from_secs(30))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("managed child spawns");
     let pid = wait_for_pid(&pidfile);
@@ -104,7 +107,8 @@ fn managed_wait_closes_retained_piped_stdin() {
             .stdin(std::process::Stdio::piped())
             .deadline(Duration::from_secs(2))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("managed child spawns");
     let mut stdout = child.take_stdout().must("stdout is piped");
@@ -123,7 +127,8 @@ fn managed_deadline_is_automatic_and_evidence_is_aggregate() {
             .arg("30")
             .deadline(configured_deadline)
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("managed child spawns");
     match child.wait() {
@@ -147,7 +152,8 @@ fn managed_poll_distinguishes_running_success_and_terminal_error() {
             .arg("30")
             .deadline(Duration::from_secs(30))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("sleep spawns");
     assert!(matches!(running.poll(), ManagedPoll::Running));
@@ -157,7 +163,8 @@ fn managed_poll_distinguishes_running_success_and_terminal_error() {
         Command::new("/bin/true")
             .deadline(Duration::from_secs(2))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("true spawns");
     wait_for_terminal_poll(&mut success, true);
@@ -167,7 +174,8 @@ fn managed_poll_distinguishes_running_success_and_terminal_error() {
         Command::new("/bin/false")
             .deadline(Duration::from_secs(2))
             .must("deadline is valid")
-            .streaming(),
+            .streaming()
+            .must("streaming policy is valid"),
     )
     .must("false spawns");
     wait_for_terminal_poll(&mut failed, false);

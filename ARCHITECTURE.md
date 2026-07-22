@@ -12,7 +12,7 @@ Command typestate
   ├─ environment: Clean | Allowlist | InheritAll(reason)
   └─ bytes: capture bounded(10 MiB/stream, fail-closed)
             | truncate | unbounded(exceptional reason)
-            | streaming() structural transition
+            | streaming()? structural transition
                          │
                          ▼
                     supervisor
@@ -50,12 +50,13 @@ succeeded. Capture itself never moves to a background worker. The reaper
 endpoint is created fallibly before process spawn, so thread-creation failure
 cannot strand an already-running child.
 
-`ManagedChild` is the supervised handoff produced only by the explicit
-`Command<Ready>::streaming()` transition. The caller owns pipe bytes and
+`ManagedChild` is the supervised handoff produced only by the explicit,
+fallible `Command<Ready>::streaming()` transition. The caller owns pipe bytes and
 backpressure; the supervisor keeps deadline, cancellation, kill-before-reap,
 and bounded cleanup together. `wait` closes retained stdin, typed `poll`
 distinguishes running/success/error, `cancel` returns aggregate evidence only
-after complete cancellation cleanup, and drop waits only the hard allowance.
+after complete cancellation cleanup, and drop requests cancellation without
+blocking while the detached supervisor finishes bounded cleanup.
 
 ## Portability boundary
 
@@ -73,8 +74,9 @@ sandbox or container designed for that purpose.
 The default maximum is 10 MiB independently for stdout and stderr. Crossing a
 limit persists an overflow fact and fails closed even if the leader exits
 immediately. Truncation and exceptional unbounded capture are explicit;
-streaming is a separate command state. Only pipe EOF produces `Complete` or
-`Truncated`. Read failure and cleanup-deadline snapshots produce `Incomplete`.
+streaming is a separate command state whose transition rejects non-default
+capture policies. Only pipe EOF produces `Complete` or `Truncated`. Read failure
+and cleanup-deadline snapshots produce `Incomplete`.
 
 ## Public contract
 

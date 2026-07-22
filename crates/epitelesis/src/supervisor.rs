@@ -9,7 +9,6 @@ use crate::error::Result;
 use crate::policy::Ready;
 
 pub(crate) const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-pub(crate) const MANAGED_DROP_BUDGET: std::time::Duration = crate::policy::CLEANUP_ALLOWANCE;
 
 pub(crate) struct ManagedLaunch {
     pub(crate) id: u32,
@@ -118,7 +117,7 @@ pub(crate) fn spawn_managed(command: StreamingCommand) -> Result<ManagedLaunch> 
     ))
 ))]
 mod unix {
-    use std::io::Read as _;
+    use std::io::Read;
     use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use std::thread;
@@ -208,9 +207,11 @@ mod unix {
             mut command,
             program,
             execution,
-            stdout_capture: _,
-            stderr_capture: _,
+            stdout_capture,
+            stderr_capture,
         } = prepared;
+        debug_assert!(stdout_capture.is_default());
+        debug_assert!(stderr_capture.is_default());
         let reaper = match start_background_reaper(&program) {
             Ok(reaper) => reaper,
             Err(error) => {
@@ -417,13 +418,11 @@ mod unix {
         let signal = signal_group(&owned);
         let mut status = None;
         let mut reap_disposition = LeaderReapDisposition::Unreaped;
-        let mut reap_attempted = false;
         while Instant::now() < cleanup_deadline {
             observations.cancelled |= cancellation.is_cancelled();
             observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
             observe_leader(&owned, &mut observations);
-            if observations.leader_waitable && owned.has_child() && !reap_attempted {
-                reap_attempted = true;
+            if observations.leader_waitable && owned.has_child() {
                 match owned.reap_waitable() {
                     Ok(reaped) => {
                         status = Some(reaped);
@@ -433,6 +432,7 @@ mod unix {
                         observations
                             .reap_failures
                             .push(FailureEvidence::from_io("reap process leader", &error));
+                        break;
                     }
                 }
             }

@@ -1,7 +1,7 @@
 //! Managed streaming child handle.
 
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use snafu::IntoError as _;
 
@@ -27,9 +27,9 @@ pub enum ManagedPoll<'a> {
 /// A streaming child whose deadline, cancellation, group cleanup, and reap are
 /// owned by a background supervisor rather than caller polling.
 ///
-/// Drop requests cancellation and waits through the documented cleanup
-/// allowance. If scheduling prevents completion within that bound, the
-/// detached supervisor retains sole lifecycle ownership until it finishes.
+/// Drop requests cancellation without blocking. The detached supervisor
+/// retains sole lifecycle ownership through bounded cleanup and any required
+/// background-reaper handoff.
 #[must_use = "dropping ManagedChild only requests cancellation"]
 pub struct ManagedChild {
     id: u32,
@@ -44,7 +44,7 @@ pub struct ManagedChild {
 
 /// Spawn an explicitly streaming managed child.
 ///
-/// A captured command must first make the structural streaming transition:
+/// A captured command must first make the fallible structural streaming transition:
 ///
 /// ```compile_fail
 /// use epitelesis::{Command, spawn_managed};
@@ -156,16 +156,6 @@ impl ManagedChild {
         self.join_after_result();
     }
 
-    fn join_if_finished(&mut self) {
-        if self
-            .supervisor
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-        {
-            self.join_after_result();
-        }
-    }
-
     fn join_after_result(&mut self) {
         let Some(supervisor) = self.supervisor.take() else {
             return;
@@ -237,27 +227,62 @@ impl Drop for ManagedChild {
         if self.supervisor.is_none() {
             return;
         }
-        if self.result.is_some() {
-            self.join_if_finished();
-            return;
+        if self.result.is_none() {
+            drop(self.stdin.take());
+            let _ = self.cancel.send(());
         }
-        drop(self.stdin.take());
-        let _ = self.cancel.send(());
-        match self
-            .receiver
-            .recv_timeout(crate::supervisor::MANAGED_DROP_BUDGET)
-        {
-            Ok(result) => {
-                self.result = Some(result);
-                self.join_if_finished();
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                self.result = Some(Err(
-                    self.channel_failure("managed supervisor result channel closed")
-                ));
-                self.join_if_finished();
-            }
-        }
+        drop(self.supervisor.take());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_cancels_without_waiting_for_supervisor_settlement() {
+        let (cancel, cancel_receiver) = std::sync::mpsc::channel();
+        let (result_sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        let (ready, ready_receiver) = std::sync::mpsc::sync_channel(0);
+        let (finished, finished_receiver) = std::sync::mpsc::sync_channel(1);
+        let supervisor = std::thread::spawn(move || {
+            assert!(ready.send(()).is_ok());
+            assert!(cancel_receiver.recv().is_ok());
+            assert!(release_receiver.recv().is_ok());
+            drop(result_sender);
+            assert!(finished.send(()).is_ok());
+        });
+        let child = ManagedChild {
+            id: 0,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            cancel,
+            receiver,
+            supervisor: Some(supervisor),
+            result: None,
+        };
+        assert!(
+            ready_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "fixture supervisor did not start"
+        );
+
+        let started = std::time::Instant::now();
+        drop(child);
+        let elapsed = started.elapsed();
+        assert!(release.send(()).is_ok());
+        assert!(
+            finished_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "detached supervisor did not finish"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "drop blocked for {elapsed:?}"
+        );
     }
 }

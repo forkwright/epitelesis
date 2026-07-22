@@ -281,9 +281,27 @@ impl Command<Ready> {
     }
 
     /// Explicitly transfer stdout/stderr byte and backpressure ownership to the caller.
-    #[must_use]
-    pub fn streaming(self) -> StreamingCommand {
-        StreamingCommand { command: self }
+    ///
+    /// Managed streaming rejects non-default capture policies rather than
+    /// silently discarding them.
+    pub fn streaming(self) -> Result<StreamingCommand> {
+        if !self.stdout_capture.is_default() {
+            return InvalidPolicySnafu {
+                violation: PolicyViolation::CapturePolicyWithStreaming(
+                    crate::output::StreamName::Stdout,
+                ),
+            }
+            .fail();
+        }
+        if !self.stderr_capture.is_default() {
+            return InvalidPolicySnafu {
+                violation: PolicyViolation::CapturePolicyWithStreaming(
+                    crate::output::StreamName::Stderr,
+                ),
+            }
+            .fail();
+        }
+        Ok(StreamingCommand { command: self })
     }
 }
 
@@ -291,7 +309,8 @@ impl Command<Ready> {
 ///
 /// Entering this state disables supervisor capture: the caller must take and
 /// drain piped handles, while the supervisor retains deadline, cancellation,
-/// process-group termination, and reap ownership.
+/// process-group termination, and reap ownership. The transition rejects any
+/// non-default capture policy.
 ///
 /// ```compile_fail
 /// use epitelesis::Command;

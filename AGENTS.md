@@ -20,8 +20,8 @@ typed, and sync/async semantics aligned.
   `InheritAll` requires a reason.
 - Capture defaults to 10 MiB independently for stdout and stderr and fails
   closed at the limit. Truncation and exceptional unbounded capture are
-  explicit policies; managed streaming requires the structural `streaming()`
-  transition.
+  explicit policies; managed streaming requires the fallible structural
+  `streaming()` transition, which rejects non-default capture policies.
 - One supervisor owns process-group termination before reap, bounded capture
   cleanup, and aggregate evidence.
 - `ManagedChild` retains deadline, cancellation, and reap ownership while the
@@ -62,7 +62,7 @@ cargo test --workspace --all-features --doc
 Branch protection consumes the exact `gate / gate-attestation` context. The PR
 caller and local reusable preserve that name. The local reusable permits only
 the enumerated documentation-only exemption and otherwise runs the full gate on
-GitHub-hosted infrastructure. Never fabricate a `Gate-Passed:` trailer.
+GitHub-hosted infrastructure.
 
 ## Change discipline
 
