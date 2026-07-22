@@ -160,7 +160,9 @@ mod unix {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let supervisor = thread::Builder::new()
             .name("epitelesis-managed-supervisor".to_owned())
-            .spawn(move || managed_supervisor(prepared, &cancel_rx, startup_tx, result_tx))
+            .spawn(move || {
+                managed_supervisor(prepared, &cancel_rx, &startup_tx, &result_tx);
+            })
             .map_err(|source| {
                 SupervisorStartFailedSnafu {
                     program: program.clone(),
@@ -200,8 +202,8 @@ mod unix {
     fn managed_supervisor(
         prepared: PreparedCommand,
         cancel: &Receiver<()>,
-        startup: mpsc::SyncSender<Result<ManagedStartup>>,
-        result: mpsc::SyncSender<Result<ManagedOutput>>,
+        startup: &mpsc::SyncSender<Result<ManagedStartup>>,
+        result: &mpsc::SyncSender<Result<ManagedOutput>>,
     ) {
         let PreparedCommand {
             mut command,
@@ -246,14 +248,14 @@ mod unix {
             let _ = owned.handoff_to_background_reaper();
             return;
         }
-        let terminal = supervise_managed(owned, program, execution, deadline, started, cancel);
+        let terminal = supervise_managed(owned, program, &execution, deadline, started, cancel);
         let _ = result.send(terminal);
     }
 
     fn supervise_managed(
         mut owned: OwnedChild,
         program: String,
-        execution: ExecutionPolicy,
+        execution: &ExecutionPolicy,
         deadline: Option<Instant>,
         started: Instant,
         cancel: &Receiver<()>,
@@ -345,6 +347,14 @@ mod unix {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the blocking supervisor owns its cancellation token through cleanup and reap"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the single-owner lifecycle keeps supervision and cleanup ordering explicit"
+    )]
     pub(super) fn execute(prepared: PreparedCommand, cancellation: Cancellation) -> Result<Output> {
         let PreparedCommand {
             mut command,
@@ -360,7 +370,7 @@ mod unix {
             policy = ?execution,
         );
         let _entered = span.enter();
-        let reaper = start_background_reaper(&program)?;
+        let reaper_sender = start_background_reaper(&program)?;
         let started = Instant::now();
         let deadline = execution.deadline(started)?;
         let configured_deadline = execution.duration();
@@ -368,18 +378,18 @@ mod unix {
             Ok(child) => child,
             Err(source) => return Err(SpawnFailedSnafu { program }.into_error(source)),
         };
-        let mut owned = OwnedChild::new(child, reaper);
+        let mut owned = OwnedChild::new(child, reaper_sender);
         drop(owned.child_mut().and_then(|child| child.stdin.take()));
 
         let mut stdout = CaptureStream::new(
             StreamName::Stdout,
             owned.child_mut().and_then(|child| child.stdout.take()),
-            stdout_capture,
+            &stdout_capture,
         );
         let mut stderr = CaptureStream::new(
             StreamName::Stderr,
             owned.child_mut().and_then(|child| child.stderr.take()),
-            stderr_capture,
+            &stderr_capture,
         );
         stdout.make_nonblocking();
         stderr.make_nonblocking();
@@ -837,13 +847,13 @@ mod unix {
     }
 
     impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
-        fn new(name: StreamName, pipe: Option<Pipe>, policy: CapturePolicy) -> Self {
+        fn new(name: StreamName, pipe: Option<Pipe>, policy: &CapturePolicy) -> Self {
             let redirected = pipe.is_none();
             let storage = match policy {
                 CapturePolicy::Bounded { limit, overflow } => CaptureStorage::Bounded {
                     bytes: Vec::new(),
-                    limit,
-                    overflow,
+                    limit: *limit,
+                    overflow: *overflow,
                 },
                 CapturePolicy::Unbounded(_) => CaptureStorage::Unbounded(Vec::new()),
             };
@@ -866,7 +876,7 @@ mod unix {
                     .map_err(errno_to_io)
             });
             if let Some(Err(error)) = result {
-                self.record_failure(error);
+                self.record_failure(&error);
             }
         }
 
@@ -887,7 +897,7 @@ mod unix {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
                     Err(error) => {
-                        self.record_failure(error);
+                        self.record_failure(&error);
                         return;
                     }
                 }
@@ -897,13 +907,14 @@ mod unix {
         fn retain(&mut self, chunk: &[u8]) {
             let mut allocation_failed = false;
             match &mut self.storage {
-                CaptureStorage::Unbounded(bytes) => match bytes.try_reserve(chunk.len()) {
-                    Ok(()) => bytes.extend_from_slice(chunk),
-                    Err(_) => {
+                CaptureStorage::Unbounded(bytes) => {
+                    if bytes.try_reserve(chunk.len()).is_ok() {
+                        bytes.extend_from_slice(chunk);
+                    } else {
                         self.discarded = self.discarded.saturating_add(usize_to_u64(chunk.len()));
                         allocation_failed = true;
                     }
-                },
+                }
                 CaptureStorage::Bounded {
                     bytes,
                     limit,
@@ -916,13 +927,11 @@ mod unix {
                         self.overflow.get_or_insert(*limit);
                     }
                     if retained > 0 {
-                        match bytes.try_reserve(retained) {
-                            Ok(()) => bytes.extend_from_slice(&chunk[..retained]),
-                            Err(_) => {
-                                self.discarded =
-                                    self.discarded.saturating_add(usize_to_u64(retained));
-                                allocation_failed = true;
-                            }
+                        if bytes.try_reserve(retained).is_ok() {
+                            bytes.extend_from_slice(&chunk[..retained]);
+                        } else {
+                            self.discarded = self.discarded.saturating_add(usize_to_u64(retained));
+                            allocation_failed = true;
                         }
                     }
                 }
@@ -933,7 +942,7 @@ mod unix {
             }
         }
 
-        fn record_failure(&mut self, error: std::io::Error) {
+        fn record_failure(&mut self, error: &std::io::Error) {
             self.failure.get_or_insert(CaptureFailure::Read {
                 kind: error.kind(),
                 message: error.to_string(),
@@ -954,10 +963,8 @@ mod unix {
         }
 
         fn into_report(self) -> CaptureReport {
-            let bytes = match self.storage {
-                CaptureStorage::Bounded { bytes, .. } => bytes,
-                CaptureStorage::Unbounded(bytes) => bytes,
-            };
+            let (CaptureStorage::Bounded { bytes, .. } | CaptureStorage::Unbounded(bytes)) =
+                self.storage;
             let captured = if self.redirected {
                 CapturedStream::redirected()
             } else if self.eof {
@@ -1207,11 +1214,11 @@ mod unix {
                 Err(error) => panic!("unbounded fixture policy failed: {error:?}"),
             };
             let mut stdout =
-                CaptureStream::new(StreamName::Stdout, Some(FaultingPipe(stdout_file)), policy);
+                CaptureStream::new(StreamName::Stdout, Some(FaultingPipe(stdout_file)), &policy);
             let mut stderr = CaptureStream::new(
                 StreamName::Stderr,
                 Some(HoldingPipe(stderr_file)),
-                CapturePolicy::bounded(8),
+                &CapturePolicy::bounded(8),
             );
             stdout.pump(1);
             stderr.pump(1);

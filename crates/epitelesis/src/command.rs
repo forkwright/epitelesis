@@ -479,6 +479,10 @@ fn validate_path_policy<State>(command: &Command<State>) -> Result<()> {
         target_os = "wasi"
     ))
 ))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the cfg-paired unsupported implementation returns a typed pre-spawn error"
+)]
 fn validate_backend() -> Result<()> {
     Ok(())
 }

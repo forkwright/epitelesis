@@ -218,7 +218,7 @@ impl std::fmt::Debug for ManagedChild {
             .field("stdout", &self.stdout.as_ref().map(|_| "available"))
             .field("stderr", &self.stderr.as_ref().map(|_| "available"))
             .field("settled", &self.result.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

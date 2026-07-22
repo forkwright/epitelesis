@@ -105,9 +105,10 @@ impl ExecutionPolicy {
 }
 
 /// Which portion of the parent environment is visible before explicit ops.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub enum EnvironmentPolicy {
     /// Begin with an empty environment.
+    #[default]
     Clean,
     /// Copy only the named keys that exist in the parent environment.
     Allowlist(BTreeSet<OsString>),
@@ -147,12 +148,6 @@ impl EnvironmentPolicy {
             Self::Allowlist(keys) => keys.contains(key),
             Self::InheritAll(_) => true,
         }
-    }
-}
-
-impl Default for EnvironmentPolicy {
-    fn default() -> Self {
-        Self::Clean
     }
 }
 
@@ -245,6 +240,10 @@ pub enum PolicyViolation {
 }
 
 impl fmt::Display for PolicyViolation {
+    #[expect(
+        clippy::unnecessary_debug_formatting,
+        reason = "Debug formatting preserves escaping for arbitrary OS-string program names"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyReason => f.write_str("exceptional policy reason must not be empty"),
