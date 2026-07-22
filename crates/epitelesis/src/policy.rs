@@ -15,9 +15,25 @@ pub const DEFAULT_CAPTURE_LIMIT: usize = 10 * 1024 * 1024;
 #[derive(Debug)]
 pub struct Draft;
 
-/// Marker for a command whose lifecycle policy is valid and runnable.
+/// State for a command whose lifecycle policy is valid and runnable.
 #[derive(Debug)]
-pub struct Ready;
+pub struct Ready {
+    execution: ExecutionPolicy,
+}
+
+impl Ready {
+    pub(crate) fn new(execution: ExecutionPolicy) -> Self {
+        Self { execution }
+    }
+
+    pub(crate) fn execution(&self) -> &ExecutionPolicy {
+        &self.execution
+    }
+
+    pub(crate) fn into_execution(self) -> ExecutionPolicy {
+        self.execution
+    }
+}
 
 /// A non-empty explanation attached to exceptional policy choices.
 #[derive(Clone, Eq, PartialEq)]

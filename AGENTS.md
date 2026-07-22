@@ -56,8 +56,9 @@ cargo test --workspace --all-features --doc
 ```
 
 Branch protection consumes the exact `gate / gate-attestation` context. The PR
-caller and local adapter preserve that name while the pinned public reusable
-owns build logic and concurrency. Never fabricate a `Gate-Passed:` trailer.
+caller and local reusable preserve that name. The local reusable permits only
+the enumerated documentation-only exemption and otherwise runs the full gate on
+GitHub-hosted infrastructure. Never fabricate a `Gate-Passed:` trailer.
 
 ## Change discipline
 

@@ -1,7 +1,6 @@
 //! Typestate command builder and process translation.
 
 use std::ffi::{OsStr, OsString};
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::time::Duration;
@@ -47,8 +46,7 @@ pub struct Command<State = Draft> {
     pub(crate) stderr: Option<Stdio>,
     pub(crate) stdout_capture: CapturePolicy,
     pub(crate) stderr_capture: CapturePolicy,
-    pub(crate) execution: Option<ExecutionPolicy>,
-    state: PhantomData<State>,
+    state: State,
 }
 
 impl Command<Draft> {
@@ -66,29 +64,25 @@ impl Command<Draft> {
             stderr: None,
             stdout_capture: CapturePolicy::default(),
             stderr_capture: CapturePolicy::default(),
-            execution: None,
-            state: PhantomData,
+            state: Draft,
         }
     }
 
     /// Declare a bounded wall-clock lifetime and make the command runnable.
-    pub fn deadline(mut self, duration: Duration) -> Result<Command<Ready>> {
+    pub fn deadline(self, duration: Duration) -> Result<Command<Ready>> {
         validate_deadline(duration)?;
-        self.execution = Some(ExecutionPolicy::Deadline(duration));
-        Ok(self.into_state())
+        Ok(self.into_state(Ready::new(ExecutionPolicy::Deadline(duration))))
     }
 
     /// Intentionally permit an unbounded lifetime for a non-empty reason.
-    pub fn unbounded(mut self, reason: impl Into<String>) -> Result<Command<Ready>> {
-        self.execution = Some(ExecutionPolicy::Unbounded(
-            crate::policy::NonEmptyReason::new(reason)?,
-        ));
-        Ok(self.into_state())
+    pub fn unbounded(self, reason: impl Into<String>) -> Result<Command<Ready>> {
+        let execution = ExecutionPolicy::Unbounded(crate::policy::NonEmptyReason::new(reason)?);
+        Ok(self.into_state(Ready::new(execution)))
     }
 }
 
 impl<State> Command<State> {
-    fn into_state<Next>(self) -> Command<Next> {
+    fn into_state<Next>(self, state: Next) -> Command<Next> {
         Command {
             program: self.program,
             args: self.args,
@@ -100,8 +94,7 @@ impl<State> Command<State> {
             stderr: self.stderr,
             stdout_capture: self.stdout_capture,
             stderr_capture: self.stderr_capture,
-            execution: self.execution,
-            state: PhantomData,
+            state,
         }
     }
 
@@ -274,10 +267,7 @@ impl Command<Ready> {
     /// Borrow the validated execution policy.
     #[must_use]
     pub fn execution_policy(&self) -> &ExecutionPolicy {
-        match self.execution.as_ref() {
-            Some(policy) => policy,
-            None => panic!("Ready typestate always contains an execution policy"),
-        }
+        self.state.execution()
     }
 
     /// Run and capture stdout and stderr.
@@ -296,7 +286,7 @@ impl Command<Ready> {
     }
 }
 
-impl<State> std::fmt::Debug for Command<State> {
+impl<State: std::fmt::Debug> std::fmt::Debug for Command<State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Command")
             .field("program", &self.program)
@@ -309,7 +299,7 @@ impl<State> std::fmt::Debug for Command<State> {
             .field("stderr", &self.stderr.as_ref().map(|_| "configured"))
             .field("stdout_capture", &self.stdout_capture)
             .field("stderr_capture", &self.stderr_capture)
-            .field("execution", &self.execution)
+            .field("state", &self.state)
             .finish()
     }
 }
@@ -337,8 +327,7 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
         stderr,
         stdout_capture,
         stderr_capture,
-        execution,
-        state: _,
+        state,
     } = command;
     let program_display = program.display().to_string();
     let mut process = StdCommand::new(&program);
@@ -383,10 +372,7 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
     Ok(PreparedCommand {
         command: process,
         program: program_display,
-        execution: match execution {
-            Some(policy) => policy,
-            None => panic!("Ready typestate always contains an execution policy"),
-        },
+        execution: state.into_execution(),
         stdout_capture,
         stderr_capture,
     })

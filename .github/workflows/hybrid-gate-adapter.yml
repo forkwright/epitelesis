@@ -1,4 +1,4 @@
-name: Hybrid Gate Adapter
+name: Hosted Gate Adapter
 
 on:
   workflow_call:
@@ -7,29 +7,113 @@ permissions:
   contents: read
 
 jobs:
-  hybrid-gate:
-    uses: forkwright/.github/.github/workflows/hybrid-gate.yml@dca8a29deedb6d665fd12ad4121f6e68988cad91
-    with:
-      fmt_cmd: cargo fmt --all -- --check
-      check_cmd: cargo check --workspace --all-targets --all-features
-      clippy_cmd: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      nextest_cmd: cargo nextest run --workspace --all-features
-      doctest_cmd: cargo test --workspace --all-features --doc
-      needs_fleet_repo_token: false
-
   gate-attestation:
-    needs: hybrid-gate
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
+    name: gate-attestation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
-      - name: Require the nested gate to pass
+      - name: Check out the exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify the narrowly enumerated docs-only exemption
+        id: classify
+        shell: bash
         env:
-          NESTED_RESULT: ${{ needs.hybrid-gate.result }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [ "$NESTED_RESULT" != "success" ]; then
-            echo "Nested hybrid gate result was $NESTED_RESULT; expected success." >&2
-            exit 1
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git diff --name-only --diff-filter=ACMRTUXB -z \
+            "${BASE_SHA}...${HEAD_SHA}" > "${RUNNER_TEMP}/changed-files.z"
+
+          docs_only=true
+          changed_count=0
+          : > changed-files.txt
+          while IFS= read -r -d '' path; do
+            changed_count=$((changed_count + 1))
+            printf '%q\n' "$path" >> changed-files.txt
+            case "$path" in
+              README.md | ARCHITECTURE.md | SECURITY.md | AGENTS.md | CLAUDE.md | llms.txt | \
+                _llm/architecture.toml | _llm/current_state.toml | _llm/decisions.toml)
+                ;;
+              *)
+                docs_only=false
+                ;;
+            esac
+          done < "${RUNNER_TEMP}/changed-files.z"
+
+          if [ "$changed_count" -eq 0 ]; then
+            docs_only=false
           fi
-          echo "Nested hybrid gate passed."
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "Changed paths:"
+          sed 's/^/  /' changed-files.txt
+
+      - name: Record docs-only exemption
+        if: ${{ steps.classify.outputs.docs_only == 'true' }}
+        run: |
+          echo "Only explicitly enumerated documentation paths changed."
+          echo "The hosted Rust build is exempt for this pull request."
+
+      - name: Install the declared Rust toolchain
+        if: ${{ steps.classify.outputs.docs_only != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          rustup toolchain install 1.94.0 --profile minimal \
+            --component rustfmt,clippy 2>&1 | tee ci-logs/toolchain.log
+          rustup default 1.94.0 2>&1 | tee -a ci-logs/toolchain.log
+
+      - name: Restore Cargo caches
+        if: ${{ steps.classify.outputs.docs_only != 'true' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-1.94.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-1.94.0-
+
+      - name: Install cargo-nextest
+        if: ${{ steps.classify.outputs.docs_only != 'true' }}
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run the complete Rust gate
+        if: ${{ steps.classify.outputs.docs_only != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check 2>&1 | tee ci-logs/fmt.log
+          cargo check --locked --workspace --all-targets --all-features \
+            2>&1 | tee ci-logs/check.log
+          cargo clippy --locked --workspace --all-targets --all-features -- \
+            -D warnings 2>&1 | tee ci-logs/clippy.log
+          cargo nextest run --locked --workspace --all-features \
+            2>&1 | tee ci-logs/nextest.log
+          cargo test --locked --workspace --all-features --doc \
+            2>&1 | tee ci-logs/doctest.log
+
+      - name: Upload failure evidence
+        if: ${{ failure() && steps.classify.outputs.docs_only != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gate-failure-${{ github.event.pull_request.head.sha }}
+          path: |
+            ci-logs/
+            changed-files.txt
+          if-no-files-found: warn
+          retention-days: 7

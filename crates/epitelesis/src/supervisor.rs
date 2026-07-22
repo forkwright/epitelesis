@@ -210,16 +210,16 @@ mod unix {
                 secondary,
             }
             .fail(),
-            Primary::Limit { .. }
-            | Primary::CaptureFailure
-            | Primary::Supervision(_) => SupervisionFailedSnafu {
-                program,
-                source: std::io::Error::other("invalid managed supervisor state"),
-                stdout: CapturedStream::redirected(),
-                stderr: CapturedStream::redirected(),
-                secondary,
+            Primary::Limit { .. } | Primary::CaptureFailure | Primary::Supervision(_) => {
+                SupervisionFailedSnafu {
+                    program,
+                    source: std::io::Error::other("invalid managed supervisor state"),
+                    stdout: CapturedStream::redirected(),
+                    stderr: CapturedStream::redirected(),
+                    secondary,
+                }
+                .fail()
             }
-            .fail(),
         }
     }
 
@@ -690,10 +690,7 @@ mod unix {
     }
 
     enum CaptureBuffer {
-        Bounded {
-            storage: Box<[u8]>,
-            len: usize,
-        },
+        Bounded { storage: Box<[u8]>, len: usize },
         Unbounded(Vec<u8>),
     }
 
@@ -783,10 +780,7 @@ mod unix {
 
     fn take_captured(state: &Arc<Mutex<WorkerState>>) -> CapturedStream {
         let mut state = lock_state(state);
-        let buffer = std::mem::replace(
-            &mut state.buffer,
-            CaptureBuffer::Unbounded(Vec::new()),
-        );
+        let buffer = std::mem::replace(&mut state.buffer, CaptureBuffer::Unbounded(Vec::new()));
         let bytes = match buffer {
             CaptureBuffer::Bounded { storage, len } => {
                 let mut bytes = storage.into_vec();
@@ -801,17 +795,16 @@ mod unix {
     fn snapshot_captured(state: &Arc<Mutex<WorkerState>>) -> CapturedStream {
         let state = lock_state(state);
         let bytes = match &state.buffer {
-            CaptureBuffer::Bounded { storage, len } => storage[..*len]
-                .to_vec()
-                .into_boxed_slice()
-                .into_vec(),
+            CaptureBuffer::Bounded { storage, len } => {
+                storage[..*len].to_vec().into_boxed_slice().into_vec()
+            }
             CaptureBuffer::Unbounded(bytes) => bytes.clone(),
         };
         CapturedStream::complete(bytes, state.discarded)
     }
 
     struct OwnedChild {
-        child: Option<Child>,
+        child: Child,
         pgid: Pid,
         armed: bool,
     }
@@ -820,17 +813,14 @@ mod unix {
         fn new(child: Child) -> Self {
             let pgid = Pid::from_child(&child);
             Self {
-                child: Some(child),
+                child,
                 pgid,
                 armed: true,
             }
         }
 
         fn child_mut(&mut self) -> &mut Child {
-            match self.child.as_mut() {
-                Some(child) => child,
-                None => panic!("owned child accessed after reap"),
-            }
+            &mut self.child
         }
 
         fn signal_group(&self) -> std::io::Result<()> {
@@ -857,9 +847,7 @@ mod unix {
                 return;
             }
             let _ = kill_process_group(self.pgid, Signal::KILL);
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.wait();
-            }
+            let _ = self.child.wait();
             self.armed = false;
         }
     }
