@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.0](https://github.com/forkwright/epitelesis/compare/v0.2.0...v0.3.0) (2026-07-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* enforce the v1 invocation lifecycle contract ([#17](https://github.com/forkwright/epitelesis/issues/17))
+
+### Features
+
+* enforce the v1 invocation lifecycle contract ([#17](https://github.com/forkwright/epitelesis/issues/17)) ([4003bbb](https://github.com/forkwright/epitelesis/commit/4003bbba602fcdf4874779725b32a92849f26131))
+
+
+### Bug Fixes
+
+* **release:** use a predicate release-please actually matches for Cargo.lock ([#20](https://github.com/forkwright/epitelesis/issues/20)) ([c4490aa](https://github.com/forkwright/epitelesis/commit/c4490aae3f9561014a20d830d4421a8be5b365d0)), closes [#19](https://github.com/forkwright/epitelesis/issues/19)
+
 ## [0.2.0](https://github.com/forkwright/epitelesis/compare/v0.1.0...v0.2.0) (2026-07-08)
 
 
