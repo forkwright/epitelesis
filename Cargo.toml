@@ -43,7 +43,7 @@ must_use_candidate = "allow"
 unsafe_code = "deny"
 
 [workspace.dependencies]
-snafu = "0.8"
+snafu = "0.9"
 tracing = "0.1"
 tokio = { version = "1", features = ["full", "test-util"] }
 
