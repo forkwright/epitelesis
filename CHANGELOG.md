@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/forkwright/epitelesis/compare/v0.3.0...v0.4.0) (2026-08-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deps:** move to snafu 0.9 ([#24](https://github.com/forkwright/epitelesis/issues/24))
+
+### Features
+
+* **deps:** move to snafu 0.9 ([#24](https://github.com/forkwright/epitelesis/issues/24)) ([4bae42f](https://github.com/forkwright/epitelesis/commit/4bae42fb6f80b6457871b04c7a5b420107c759b1))
+
 ## [0.3.0](https://github.com/forkwright/epitelesis/compare/v0.2.0...v0.3.0) (2026-07-28)
 
 
