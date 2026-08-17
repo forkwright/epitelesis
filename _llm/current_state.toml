@@ -11,7 +11,7 @@ source_docs = [
 ]
 
 [state]
-release_version = "0.3.0" # x-release-please-version
+release_version = "0.4.0" # x-release-please-version
 release_status = "The workspace, local lockfile package, manifest, README pin, machine state, and ancestral local tag agree."
 contract_status = "The breaking v1 invocation and supervisor contract is implemented on the convergence branch and awaits exact-head hosted compilation and gate evidence."
 updated = "2026-07-22"
