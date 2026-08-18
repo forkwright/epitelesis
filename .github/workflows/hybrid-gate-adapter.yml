@@ -101,7 +101,10 @@ jobs:
     needs: policy
     if: ${{ needs.policy.outputs.code_affecting == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # WHY 90m: the fleet's full-gate budget moved to 90 for cold-cache reality
+    # (forkwright/.github#45, kanon#10081) — this local adapter was the one
+    # consumer the reusable's raise cannot reach.
+    timeout-minutes: 90
     permissions:
       contents: read
     env:
