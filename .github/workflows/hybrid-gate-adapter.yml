@@ -101,9 +101,18 @@ jobs:
     needs: policy
     if: ${{ needs.policy.outputs.code_affecting == 'true' }}
     runs-on: ubuntu-24.04
-    # WHY 90m: the fleet's full-gate budget moved to 90 for cold-cache reality
-    # (forkwright/.github#45, kanon#10081) — this local adapter was the one
-    # consumer the reusable's raise cannot reach.
+    # WHY 90m: mirrors forkwright/.github#45's raised default for
+    # full_gate_timeout_minutes. This job is a hand-copy of the fleet hybrid-gate
+    # reusable rather than a workflow_call consumer of it, so it does not inherit
+    # that input and must be kept in sync by hand.
+    #
+    # WARNING: this whole file duplicates forkwright/.github's hybrid-gate.yml
+    # (policy/docs-only classification, full-gate-build, gate-attestation) instead
+    # of calling it directly the way forkwright/zetesis does. A direct call is
+    # blocked here: the fleet reusable's aggregation job is named "gate", so
+    # switching would rename this repo's required check from
+    # "gate / gate-attestation" to "gate / gate" and break branch protection until
+    # coordinated with a protection update.
     timeout-minutes: 90
     permissions:
       contents: read
