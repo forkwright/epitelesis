@@ -14,7 +14,7 @@ the same line.
 
 ```toml
 [dependencies]
-epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.4.0" } # x-release-please-version
+epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.4.1" } # x-release-please-version
 ```
 
 The remaining sections define the fixed breaking contract for v1. They do not

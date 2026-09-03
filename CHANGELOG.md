@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/forkwright/epitelesis/compare/v0.4.0...v0.4.1) (2026-09-03)
+
+
+### Documentation
+
+* **state:** drop stale convergence-branch claim, fix dead issue citation ([#36](https://github.com/forkwright/epitelesis/issues/36)) ([d6133f7](https://github.com/forkwright/epitelesis/commit/d6133f77a47c6dc583dcfee57a4e0a7f0e4539d7))
+
 ## [0.4.0](https://github.com/forkwright/epitelesis/compare/v0.3.0...v0.4.0) (2026-08-17)
 
 
