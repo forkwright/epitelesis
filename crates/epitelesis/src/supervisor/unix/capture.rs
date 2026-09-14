@@ -62,7 +62,7 @@ impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
         let result = self.pipe.as_ref().map(|pipe| {
             fcntl_getfl(pipe)
                 .and_then(|flags| fcntl_setfl(pipe, flags | OFlags::NONBLOCK))
-                .map_err(errno_to_io)
+                .map_err(std::io::Error::from)
         });
         if let Some(Err(error)) = result {
             self.record_failure(&error);
@@ -202,7 +202,7 @@ pub(super) fn poll_streams(
                 PollFd::new(stdout_pipe, events),
                 PollFd::new(stderr_pipe, events),
             ];
-            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            poll(&mut descriptors, Some(&timespec)).map_err(std::io::Error::from)?;
             Ok((
                 poll_ready(descriptors.first()),
                 poll_ready(descriptors.get(1)),
@@ -210,12 +210,12 @@ pub(super) fn poll_streams(
         }
         (Some(stdout_pipe), None) => {
             let mut descriptors = [PollFd::new(stdout_pipe, events)];
-            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            poll(&mut descriptors, Some(&timespec)).map_err(std::io::Error::from)?;
             Ok((poll_ready(descriptors.first()), false))
         }
         (None, Some(stderr_pipe)) => {
             let mut descriptors = [PollFd::new(stderr_pipe, events)];
-            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            poll(&mut descriptors, Some(&timespec)).map_err(std::io::Error::from)?;
             Ok((false, poll_ready(descriptors.first())))
         }
         (None, None) => {
@@ -256,8 +256,4 @@ fn poll_ready(descriptor: Option<&PollFd<'_>>) -> bool {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn errno_to_io(error: rustix::io::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(error.raw_os_error())
 }

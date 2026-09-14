@@ -734,10 +734,6 @@ mod unix {
     mod owned_child;
     use owned_child::{OwnedChild, start_background_reaper};
 
-    fn errno_to_io(error: rustix::io::Errno) -> std::io::Error {
-        std::io::Error::from_raw_os_error(error.raw_os_error())
-    }
-
     #[cfg(test)]
     mod tests;
 }

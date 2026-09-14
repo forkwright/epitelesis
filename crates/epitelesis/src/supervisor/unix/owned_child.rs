@@ -68,9 +68,9 @@ impl OwnedChild {
 
     pub(super) fn signal_group(&self, signal: Signal) -> std::io::Result<()> {
         if !self.has_child() {
-            return Err(errno_to_io(rustix::io::Errno::SRCH));
+            return Err(std::io::Error::from(rustix::io::Errno::SRCH));
         }
-        kill_process_group(self.pgid, signal).map_err(errno_to_io)
+        kill_process_group(self.pgid, signal).map_err(std::io::Error::from)
     }
 
     pub(super) fn leader_waitable(&self) -> std::io::Result<bool> {
@@ -80,7 +80,7 @@ impl OwnedChild {
         let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
         waitid(WaitId::Pid(self.pgid), options)
             .map(|status| status.is_some())
-            .map_err(errno_to_io)
+            .map_err(std::io::Error::from)
     }
 
     pub(super) fn reap_waitable(&mut self) -> std::io::Result<ExitStatus> {
@@ -205,7 +205,7 @@ impl OwnedChild {
                 Err(rustix::io::Errno::SRCH) => Ok(false),
                 Err(error) => Err(FailureEvidence::from_io(
                     "inspect process group liveness",
-                    &errno_to_io(error),
+                    &std::io::Error::from(error),
                 )),
             }
         }
@@ -230,8 +230,4 @@ impl Drop for OwnedChild {
             );
         }
     }
-}
-
-fn errno_to_io(error: rustix::io::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(error.raw_os_error())
 }
