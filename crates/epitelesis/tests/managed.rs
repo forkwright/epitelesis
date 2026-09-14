@@ -178,11 +178,31 @@ fn managed_signal_waits_for_ignoring_descendant_before_settlement() {
     )
     .must("managed child spawns");
     let pid = wait_for_pid(&pidfile);
+    let leader = child.id();
     let started = Instant::now();
     child
         .signal_requester()
         .forward(ForwardedSignal::Terminate)
         .must("supervisor accepts a forwarded SIGTERM request");
+
+    // A waitable leader must continue reserving its PGID while an ignoring
+    // descendant remains and the supervisor can still escalate the group.
+    let leader_wait_deadline = started + Duration::from_millis(750);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{leader}/stat"))
+            .must("leader PID remains reserved throughout forwarding grace");
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, rest)| rest.split_whitespace().next());
+        if state == Some("Z") {
+            break;
+        }
+        assert!(
+            Instant::now() < leader_wait_deadline,
+            "leader should exit during forwarding grace"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     match child.wait() {
         Err(Error::NonZeroExit { evidence, .. }) => {

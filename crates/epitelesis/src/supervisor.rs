@@ -135,7 +135,7 @@ mod unix {
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
     use snafu::IntoError as _;
 
-    use super::{CLEANUP_BUDGET, Cancellation, ManagedLaunch};
+    use super::{CLEANUP_BUDGET, Cancellation, ManagedLaunch, SupervisorRequest};
     use crate::command::PreparedCommand;
     use crate::error::{
         CancelledSnafu, CaptureFailedSnafu, CaptureFailure, CaptureLimitExceededSnafu,
@@ -305,45 +305,15 @@ mod unix {
         let mut process_group_unsettled = true;
         while (owned.has_child() || process_group_unsettled) && Instant::now() < cleanup_deadline {
             observe_leader(&owned, &mut observations);
-            if observations.leader_waitable {
-                match owned.reap_waitable() {
-                    Ok(reaped) => {
-                        status = Some(reaped);
-                        reap_disposition = LeaderReapDisposition::Reaped;
-                    }
-                    Err(error) => {
-                        observations
-                            .reap_failures
-                            .push(FailureEvidence::from_io("reap process leader", &error));
-                        break;
-                    }
-                }
-            }
-            if !owned.has_child() {
-                process_group_unsettled =
-                    owned
-                        .has_living_process_group_member()
-                        .unwrap_or_else(|failure| {
-                            observations.reap_failures.push(failure);
-                            true
-                        });
-            }
-            if owned.has_child() {
-                let wait = cleanup_deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(EVENT_QUANTUM);
-                match request.recv_timeout(wait) {
-                    Ok(SupervisorRequest::Cancel) | Err(RecvTimeoutError::Disconnected) => {
-                        observations.cancelled = true;
-                    }
-                    Ok(SupervisorRequest::Forward(signal)) => {
-                        forward_managed_signal(&owned, signal, &mut forwarded_signal);
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-            }
+            process_group_unsettled =
+                owned
+                    .has_living_process_group_member()
+                    .unwrap_or_else(|failure| {
+                        observations.reap_failures.push(failure);
+                        true
+                    });
             if forwarded_grace_deadline.is_some_and(|grace| Instant::now() >= grace)
-                && (owned.has_child() || process_group_unsettled)
+                && process_group_unsettled
                 && forwarded_signal
                     .as_ref()
                     .is_some_and(|evidence| evidence.escalation.is_none())
@@ -353,6 +323,52 @@ mod unix {
                 if let Some(evidence) = &mut forwarded_signal {
                     evidence.escalation = Some(escalation);
                 }
+            }
+            // Keep the waitable leader unreaped while forwarding can still
+            // escalate. Its reserved PID pins our group identity; reaping it
+            // early could make a later kill target a reused, unrelated PGID.
+            let further_signal_possible = forwarded_signal
+                .as_ref()
+                .is_some_and(|evidence| evidence.escalation.is_none() && process_group_unsettled);
+            if observations.leader_waitable && !further_signal_possible && owned.has_child() {
+                match owned.reap_waitable() {
+                    Ok(reaped) => {
+                        status = Some(reaped);
+                        reap_disposition = LeaderReapDisposition::Reaped;
+                    }
+                    Err(error) => {
+                        observations
+                            .reap_failures
+                            .push(FailureEvidence::from_io("reap child", &error));
+                        observations.leader_waitable = false;
+                    }
+                }
+                process_group_unsettled =
+                    owned
+                        .has_living_process_group_member()
+                        .unwrap_or_else(|failure| {
+                            observations.reap_failures.push(failure);
+                            true
+                        });
+            }
+            if !owned.has_child() && !process_group_unsettled {
+                break;
+            }
+            let wait = cleanup_deadline
+                .saturating_duration_since(Instant::now())
+                .min(EVENT_QUANTUM);
+            match request.recv_timeout(wait) {
+                Ok(SupervisorRequest::Cancel) => observations.cancelled = true,
+                Err(RecvTimeoutError::Disconnected) => {
+                    observations.cancelled = true;
+                    // A dropped handle closes the channel immediately. Keep
+                    // bounded cleanup from spinning while descendants exit.
+                    thread::park_timeout(wait);
+                }
+                Ok(SupervisorRequest::Forward(signal)) => {
+                    forward_managed_signal(&owned, signal, &mut forwarded_signal);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
             }
         }
 
@@ -412,7 +428,7 @@ mod unix {
         signal: crate::ForwardedSignal,
         forwarded_signal: &mut Option<ForwardedSignalEvidence>,
     ) {
-        if forwarded_signal.is_none() {
+        if forwarded_signal.is_none() && owned.has_child() {
             *forwarded_signal = Some(ForwardedSignalEvidence {
                 signal,
                 outcome: signal_group_with(owned, forwarded_signal_to_os(signal)),
@@ -636,7 +652,6 @@ mod unix {
             crate::ForwardedSignal::Hangup => Signal::HUP,
             crate::ForwardedSignal::Interrupt => Signal::INT,
             crate::ForwardedSignal::Terminate => Signal::TERM,
-            _ => Signal::TERM,
         }
     }
 
@@ -1136,6 +1151,9 @@ mod unix {
         }
 
         fn signal_group(&self, signal: Signal) -> std::io::Result<()> {
+            if !self.has_child() {
+                return Err(errno_to_io(rustix::io::Errno::SRCH));
+            }
             kill_process_group(self.pgid, signal).map_err(errno_to_io)
         }
 
@@ -1188,8 +1206,9 @@ mod unix {
         /// this child-led process group. This is intentionally stricter than
         /// checking whether the leader was reaped: background descendants can
         /// survive their shell leader. Linux `/proc` is the supported source
-        /// for that proof. On another platform the supervisor reports
-        /// incomplete cleanup rather than guessing from a successful kill.
+        /// for that proof. Other supported Unix systems use the kernel's
+        /// non-signalling group-existence probe and conservatively wait for
+        /// zombies to be reaped. Only ESRCH proves that the group is gone.
         fn has_living_process_group_member(&self) -> std::result::Result<bool, FailureEvidence> {
             #[cfg(target_os = "linux")]
             {
@@ -1258,13 +1277,14 @@ mod unix {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                Err(FailureEvidence::from_io(
-                    "inspect process group liveness",
-                    &std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "process-group liveness proof requires Linux /proc",
-                    ),
-                ))
+                match rustix::process::test_kill_process_group(self.pgid) {
+                    Ok(()) => Ok(true),
+                    Err(rustix::io::Errno::SRCH) => Ok(false),
+                    Err(error) => Err(FailureEvidence::from_io(
+                        "inspect process group liveness",
+                        &errno_to_io(error),
+                    )),
+                }
             }
         }
     }
