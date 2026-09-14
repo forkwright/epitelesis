@@ -172,7 +172,7 @@ fn classify_exit(
     }
 }
 
-fn redirected_report(stream: StreamName) -> CaptureReport {
+pub(super) fn redirected_report(stream: StreamName) -> CaptureReport {
     CaptureReport {
         stream,
         captured: CapturedStream::redirected(),

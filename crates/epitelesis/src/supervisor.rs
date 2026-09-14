@@ -760,8 +760,8 @@ mod unix {
     #[path = "supervisor_evidence.rs"]
     mod evidence;
     use evidence::{
-        Observations, choose_primary, classify, classify_managed, settlement_triggered,
-        unknown_evidence,
+        Observations, choose_primary, classify, classify_managed, redirected_report,
+        settlement_triggered, unknown_evidence,
     };
 
     #[path = "supervisor_capture.rs"]
