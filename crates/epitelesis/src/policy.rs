@@ -28,8 +28,22 @@ pub struct Ready {
 }
 
 impl Ready {
-    pub(crate) fn new(execution: ExecutionPolicy) -> Self {
-        Self { execution }
+    pub(crate) fn deadline(duration: Duration) -> Result<Self> {
+        if duration == Duration::MAX || Instant::now().checked_add(duration).is_none() {
+            return InvalidPolicySnafu {
+                violation: PolicyViolation::DeadlineOverflow(duration),
+            }
+            .fail();
+        }
+        Ok(Self {
+            execution: ExecutionPolicy::Deadline(duration),
+        })
+    }
+
+    pub(crate) fn unbounded(reason: NonEmptyReason) -> Self {
+        Self {
+            execution: ExecutionPolicy::Unbounded(reason),
+        }
     }
 
     pub(crate) fn execution(&self) -> &ExecutionPolicy {
@@ -266,29 +280,5 @@ impl fmt::Display for PolicyViolation {
                 "non-default {stream:?} capture policy cannot be combined with managed streaming"
             ),
         }
-    }
-}
-
-/// A duration proved representable in the current monotonic clock domain.
-///
-/// The public execution policy continues to expose its configured duration;
-/// this crate-private value prevents a validated deadline from being confused
-/// with arbitrary input while a command transitions from [`Draft`] to
-/// [`Ready`].
-pub(crate) struct ValidatedDeadline(Duration);
-
-impl ValidatedDeadline {
-    pub(crate) fn new(duration: Duration) -> Result<Self> {
-        if duration == Duration::MAX || Instant::now().checked_add(duration).is_none() {
-            return InvalidPolicySnafu {
-                violation: PolicyViolation::DeadlineOverflow(duration),
-            }
-            .fail();
-        }
-        Ok(Self(duration))
-    }
-
-    pub(crate) fn into_duration(self) -> Duration {
-        self.0
     }
 }
