@@ -124,7 +124,6 @@ pub(crate) fn spawn_managed(command: StreamingCommand) -> Result<ManagedLaunch> 
     ))
 ))]
 mod unix {
-    use std::process::ExitStatus;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use std::thread;
     use std::time::{Duration, Instant};

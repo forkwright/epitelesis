@@ -28,6 +28,10 @@ on:
     - cron: "17 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: release-pr-checks-${{ github.repository }}
+  cancel-in-progress: false
+
 # WARNING: these permissions are a CAP on the reusable, not a default it may exceed.
 # A called workflow can only DOWNGRADE the caller's token, never upgrade it, so a
 # caller declaring the usual `contents: read` would leave the healer unable to approve
