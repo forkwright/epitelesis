@@ -82,10 +82,11 @@ them.
 
 Release truth has five synchronized files: `Cargo.toml`, the local
 `epitelesis` package in `Cargo.lock`, `.release-please-manifest.json`, the README
-dependency marker, and `_llm/current_state.toml`. Forge's protected
-`gate / gate-attestation` context verifies them before allowing either the
-exact prose-only exemption or a successful native Rust build. GitHub carries
-provider release automation and security scanning only.
+dependency marker, and `_llm/current_state.toml`. The provider release-facts
+workflow validates their alignment and authenticates prospective Release
+Please changes. Forge's `.kanon-ci.toml` owns the full Rust gate, policy tests,
+and dependency checks. Forge owns review and merges; GitHub mirrors release
+and security records.
 
 ## Cargo features
 

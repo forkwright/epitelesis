@@ -1,0 +1,47 @@
+# Release Please provenance is owned by its provider workflow. Compilation,
+# tests, and policy-script tests run through .kanon-ci.toml on Forge.
+name: Release Facts
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  release-facts:
+    name: release facts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact pull-request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify provider release provenance and synchronized facts
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_LOGIN: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "$HEAD_REPOSITORY" == "$REPOSITORY" ]] \
+            && [[ "$HEAD_REF" == release-please--branches--* ]] \
+            && [[ "$HEAD_LOGIN" == "github-actions[bot]" || "$HEAD_LOGIN" == "release-please[bot]" ]]; then
+            PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_release_truth.py \
+              --prospective --base "$BASE_SHA"
+          else
+            PYTHONDONTWRITEBYTECODE=1 python3 scripts/verify_release_truth.py
+          fi
+

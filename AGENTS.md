@@ -59,10 +59,12 @@ cargo nextest run --workspace --all-features
 cargo test --workspace --all-features --doc
 ```
 
-Forge is the canonical review, merge, and gate authority. Its native
-`gate / gate-attestation` context preserves the full Rust gate above, with only
-the enumerated documentation-only exemption. GitHub is a provider mirror for
-Release Please and security scanning; its builds never establish merge truth.
+Forge is the canonical review, merge, and gate authority. `.kanon-ci.toml`
+executes the complete Rust gate, release-policy tests, dependency checks, and
+writing checks for every change. GitHub's `release-facts.yml` owns Release
+Please provenance and the existing prospective-release policy. Provider
+security reporting also remains on GitHub. Neither workflow owns source or
+merge decisions.
 
 ## Change discipline
 

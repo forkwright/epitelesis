@@ -1,8 +1,5 @@
-# WHY: Block merges on known vulnerabilities and license/source/ban
-# violations. Runs `cargo audit` (RustSec DB) and `cargo deny check`
-# (licenses, sources, bans, advisories) on every PR and daily against main
-# so newly-published CVEs against existing deps are caught even when no PR
-# is open. See standards/CI.md § Vulnerability scanning.
+# Provider security-report publication. Rust audit/deny and their daily schedule
+# are owned by the native Forge pipeline in .kanon-ci.toml.
 name: Security
 
 on:
@@ -24,40 +21,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  cargo-deny:
-    name: cargo deny
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories licenses bans sources
-          arguments: --all-features
-
-  cargo-audit:
-    name: cargo audit
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
-      - name: Install pinned cargo-audit
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
-        with:
-          tool: cargo-audit@0.22.2
-      - name: cargo audit
-        run: cargo audit --deny unmaintained --deny unsound --deny yanked
-
   osv-scanner:
     name: osv scanner
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67

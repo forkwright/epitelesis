@@ -1250,7 +1250,7 @@ mod unix {
                                 ),
                             )
                         })?;
-                    if group == self.pgid.as_raw() as u32 && state != "Z" {
+                    if group == self.pgid.as_raw_pid() as u32 && state != "Z" {
                         return Ok(true);
                     }
                 }
