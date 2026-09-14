@@ -340,9 +340,9 @@ fn wait_until_gone(pid: u32) {
 #[test]
 fn typed_error_exposes_execution_evidence_without_treating_refusal_as_execution() {
     let refused = Command::new("/bin/true")
-        .deadline(Duration::ZERO)
+        .unbounded("")
         .err()
-        .must("a zero deadline is refused before spawn");
+        .must("an unbounded lifetime requires a reason before spawn");
     assert!(refused.evidence().is_none());
     let failed = Command::new("/bin/sh")
         .args(["-c", "printf diagnostic >&2; exit 7"])

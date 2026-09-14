@@ -23,7 +23,7 @@ cmd = "cargo clippy --workspace --all-targets --all-features --locked --jobs 8 -
 timeout_secs = 600
 
 [stages."cargo nextest"]
-cmd = "cargo nextest run --workspace --all-features --locked --build-jobs 8 --test-threads 8"
+cmd = "cargo nextest run --workspace --all-features --locked --no-fail-fast --build-jobs 8 --test-threads 8"
 timeout_secs = 900
 
 [stages."kanon lint"]
