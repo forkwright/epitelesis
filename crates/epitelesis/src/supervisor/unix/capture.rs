@@ -82,16 +82,17 @@ impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
                     self.pipe = None;
                     return;
                 }
-                Ok(count) => match chunk.get(..count) {
-                    Some(captured) => self.retain(captured),
-                    None => {
+                Ok(count) => {
+                    if let Some(captured) = chunk.get(..count) {
+                        self.retain(captured);
+                    } else {
                         self.record_failure(&std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "pipe reported a read length beyond its supplied buffer",
                         ));
                         return;
                     }
-                },
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(error) => {
@@ -186,12 +187,7 @@ pub(super) fn poll_streams(
     let events = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
     // The supervisor event quantum is below one second, so this also fits
     // 32-bit c_long on supported Unix targets.
-    let nanoseconds = Nsecs::try_from(timeout.subsec_nanos()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "poll timeout nanoseconds exceed the platform timespec field",
-        )
-    })?;
+    let nanoseconds = Nsecs::from(timeout.subsec_nanos());
     let timespec = Timespec {
         tv_sec: 0,
         tv_nsec: nanoseconds,
