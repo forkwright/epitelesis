@@ -152,8 +152,8 @@ mod unix {
     struct ManagedStartup {
         id: u32,
         stdin: Option<std::process::ChildStdin>,
-        stdout: Option<ChildStdout>,
-        stderr: Option<ChildStderr>,
+        stdout: Option<std::process::ChildStdout>,
+        stderr: Option<std::process::ChildStderr>,
     }
 
     pub(super) fn spawn_managed(prepared: PreparedCommand) -> Result<ManagedLaunch> {
@@ -725,18 +725,15 @@ mod unix {
         })
     }
 
-    #[path = "supervisor_evidence.rs"]
     mod evidence;
     use evidence::{
         Observations, choose_primary, classify, classify_managed, redirected_report,
         settlement_triggered, unknown_evidence,
     };
 
-    #[path = "supervisor_capture.rs"]
     mod capture;
     use capture::{CaptureStream, poll_streams, pump_fair};
 
-    #[path = "supervisor_owned_child.rs"]
     mod owned_child;
     use owned_child::{OwnedChild, start_background_reaper};
 
@@ -745,6 +742,5 @@ mod unix {
     }
 
     #[cfg(test)]
-    #[path = "supervisor_tests.rs"]
     mod tests;
 }
