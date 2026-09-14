@@ -8,8 +8,8 @@ use snafu::IntoError as _;
 use crate::command::StreamingCommand;
 use crate::error::{Error, Result, SupervisionFailedSnafu};
 use crate::output::{
-    CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,
-    LeaderReapOutcome, LifecycleEvidence, ManagedOutput, StreamName,
+    CaptureReport, CapturedStream, CleanupOutcome, ForwardedSignal, GroupSignalOutcome,
+    LeaderReapDisposition, LeaderReapOutcome, LifecycleEvidence, ManagedOutput, StreamName,
 };
 
 /// Typed nonblocking state of a managed streaming child.
@@ -36,10 +36,33 @@ pub struct ManagedChild {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
-    cancel: Sender<()>,
+    request: Sender<crate::supervisor::SupervisorRequest>,
     receiver: Receiver<Result<ManagedOutput>>,
     supervisor: Option<std::thread::JoinHandle<()>>,
     result: Option<Result<ManagedOutput>>,
+}
+
+/// Cloneable request path to a managed supervisor's owned process group.
+///
+/// This handle carries no process identifier and cannot reap or otherwise
+/// outlive the supervisor's lifecycle ownership.
+#[derive(Clone, Debug)]
+pub struct ManagedChildSignal {
+    request: Sender<crate::supervisor::SupervisorRequest>,
+}
+
+impl ManagedChildSignal {
+    /// Ask the serialized supervisor to forward one catchable signal.
+    pub fn forward(&self, signal: ForwardedSignal) -> std::io::Result<()> {
+        self.request
+            .send(crate::supervisor::SupervisorRequest::Forward(signal))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "managed child supervisor is no longer running",
+                )
+            })
+    }
 }
 
 /// Spawn an explicitly streaming managed child.
@@ -61,7 +84,7 @@ pub fn spawn_managed(command: StreamingCommand) -> Result<ManagedChild> {
         stdin: launch.stdin,
         stdout: launch.stdout,
         stderr: launch.stderr,
-        cancel: launch.cancel,
+        request: launch.request,
         receiver: launch.result,
         supervisor: Some(launch.supervisor),
         result: None,
@@ -73,6 +96,14 @@ impl ManagedChild {
     #[must_use]
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// Return a cloneable request handle for same-signal forwarding.
+    #[must_use]
+    pub fn signal_requester(&self) -> ManagedChildSignal {
+        ManagedChildSignal {
+            request: self.request.clone(),
+        }
     }
 
     /// Take the streaming stdin handle at most once.
@@ -119,7 +150,9 @@ impl ManagedChild {
     /// A settled cancellation returns its aggregate evidence. Incomplete or
     /// failed cleanup remains an evidence-bearing terminal error.
     pub fn cancel(mut self) -> Result<Box<LifecycleEvidence>> {
-        let _ = self.cancel.send(());
+        let _ = self
+            .request
+            .send(crate::supervisor::SupervisorRequest::Cancel);
         match self.wait_inner() {
             Ok(output) => Ok(output.evidence),
             Err(Error::Cancelled { evidence, .. }) if cancellation_settled(&evidence) => {
@@ -179,6 +212,7 @@ impl ManagedChild {
                 leader_status: None,
                 elapsed: None,
                 signal: GroupSignalOutcome::Unknown,
+                forwarded_signal: None,
                 reap: LeaderReapOutcome {
                     disposition: LeaderReapDisposition::Unknown,
                     failures: Vec::new(),
@@ -229,7 +263,9 @@ impl Drop for ManagedChild {
         }
         if self.result.is_none() {
             drop(self.stdin.take());
-            let _ = self.cancel.send(());
+            let _ = self
+                .request
+                .send(crate::supervisor::SupervisorRequest::Cancel);
         }
         drop(self.supervisor.take());
     }
@@ -241,14 +277,17 @@ mod tests {
 
     #[test]
     fn drop_cancels_without_waiting_for_supervisor_settlement() {
-        let (cancel, cancel_receiver) = std::sync::mpsc::channel();
+        let (request, request_receiver) = std::sync::mpsc::channel();
         let (result_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let (release, release_receiver) = std::sync::mpsc::channel();
         let (ready, ready_receiver) = std::sync::mpsc::sync_channel(0);
         let (finished, finished_receiver) = std::sync::mpsc::sync_channel(1);
         let supervisor = std::thread::spawn(move || {
             assert!(ready.send(()).is_ok());
-            assert!(cancel_receiver.recv().is_ok());
+            assert!(matches!(
+                request_receiver.recv(),
+                Ok(crate::supervisor::SupervisorRequest::Cancel)
+            ));
             assert!(release_receiver.recv().is_ok());
             drop(result_sender);
             assert!(finished.send(()).is_ok());
@@ -258,7 +297,7 @@ mod tests {
             stdin: None,
             stdout: None,
             stderr: None,
-            cancel,
+            request,
             receiver,
             supervisor: Some(supervisor),
             result: None,

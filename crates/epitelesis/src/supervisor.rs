@@ -15,9 +15,16 @@ pub(crate) struct ManagedLaunch {
     pub(crate) stdin: Option<std::process::ChildStdin>,
     pub(crate) stdout: Option<std::process::ChildStdout>,
     pub(crate) stderr: Option<std::process::ChildStderr>,
-    pub(crate) cancel: std::sync::mpsc::Sender<()>,
+    pub(crate) request: std::sync::mpsc::Sender<SupervisorRequest>,
     pub(crate) result: std::sync::mpsc::Receiver<Result<crate::output::ManagedOutput>>,
     pub(crate) supervisor: std::thread::JoinHandle<()>,
+}
+
+/// A caller request consumed only by the serialized managed supervisor.
+#[derive(Debug)]
+pub(crate) enum SupervisorRequest {
+    Cancel,
+    Forward(crate::ForwardedSignal),
 }
 
 /// Cooperative cancellation observed by the serialized supervisor loop.
@@ -137,8 +144,9 @@ mod unix {
         SupervisorStartFailedSnafu, TimeoutSnafu,
     };
     use crate::output::{
-        CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,
-        LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output, StreamName,
+        CaptureReport, CapturedStream, CleanupOutcome, ForwardedSignalEvidence, GroupSignalOutcome,
+        LeaderReapDisposition, LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output,
+        StreamName,
     };
     use crate::policy::{CapturePolicy, ExecutionPolicy, OverflowBehavior};
 
@@ -156,12 +164,12 @@ mod unix {
     pub(super) fn spawn_managed(prepared: PreparedCommand) -> Result<ManagedLaunch> {
         let program = prepared.program.clone();
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let supervisor = thread::Builder::new()
             .name("epitelesis-managed-supervisor".to_owned())
             .spawn(move || {
-                managed_supervisor(prepared, &cancel_rx, &startup_tx, &result_tx);
+                managed_supervisor(prepared, &request_rx, &startup_tx, &result_tx);
             })
             .map_err(|source| {
                 SupervisorStartFailedSnafu {
@@ -176,7 +184,7 @@ mod unix {
                 stdin: startup.stdin,
                 stdout: startup.stdout,
                 stderr: startup.stderr,
-                cancel: cancel_tx,
+                request: request_tx,
                 result: result_rx,
                 supervisor,
             }),
@@ -201,7 +209,7 @@ mod unix {
 
     fn managed_supervisor(
         prepared: PreparedCommand,
-        cancel: &Receiver<()>,
+        request: &Receiver<SupervisorRequest>,
         startup: &mpsc::SyncSender<Result<ManagedStartup>>,
         result: &mpsc::SyncSender<Result<ManagedOutput>>,
     ) {
@@ -244,11 +252,11 @@ mod unix {
             stderr: owned.child_mut().and_then(|child| child.stderr.take()),
         };
         if startup.send(Ok(startup_value)).is_err() {
-            let _ = owned.signal_group();
+            let _ = owned.signal_group(Signal::KILL);
             let _ = owned.handoff_to_background_reaper();
             return;
         }
-        let terminal = supervise_managed(owned, program, &execution, deadline, started, cancel);
+        let terminal = supervise_managed(owned, program, &execution, deadline, started, request);
         let _ = result.send(terminal);
     }
 
@@ -258,25 +266,40 @@ mod unix {
         execution: &ExecutionPolicy,
         deadline: Option<Instant>,
         started: Instant,
-        cancel: &Receiver<()>,
+        request: &Receiver<SupervisorRequest>,
     ) -> Result<ManagedOutput> {
         let mut observations = Observations::default();
+        let mut forwarded_signal = None;
         loop {
             observe_leader(&owned, &mut observations);
-            observations.cancelled |= cancellation_received(cancel);
+            receive_managed_request(request, &owned, &mut observations, &mut forwarded_signal);
             observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
-            if settlement_triggered(&observations, false, false) {
+            if settlement_triggered(&observations, false, false) || forwarded_signal.is_some() {
                 break;
             }
             let wait = wait_quantum(deadline, None);
-            match cancel.recv_timeout(wait) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => observations.cancelled = true,
+            match request.recv_timeout(wait) {
+                Ok(SupervisorRequest::Cancel) | Err(RecvTimeoutError::Disconnected) => {
+                    observations.cancelled = true;
+                }
+                Ok(SupervisorRequest::Forward(signal)) => {
+                    forward_managed_signal(&owned, signal, &mut forwarded_signal);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
 
         let cleanup_deadline = cleanup_deadline();
-        let signal = signal_group(&owned);
+        let forwarded_grace_deadline = forwarded_signal.as_ref().map(|_| {
+            Instant::now()
+                .checked_add(CLEANUP_BUDGET / 2)
+                .unwrap_or(cleanup_deadline)
+                .min(cleanup_deadline)
+        });
+        let mut signal = forwarded_signal.as_ref().map_or_else(
+            || signal_group(&owned),
+            |evidence: &ForwardedSignalEvidence| evidence.outcome.clone(),
+        );
         let mut status = None;
         let mut reap_disposition = LeaderReapDisposition::Unreaped;
         while owned.has_child() && Instant::now() < cleanup_deadline {
@@ -299,11 +322,26 @@ mod unix {
                 let wait = cleanup_deadline
                     .saturating_duration_since(Instant::now())
                     .min(EVENT_QUANTUM);
-                match cancel.recv_timeout(wait) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                match request.recv_timeout(wait) {
+                    Ok(SupervisorRequest::Cancel) | Err(RecvTimeoutError::Disconnected) => {
                         observations.cancelled = true;
                     }
+                    Ok(SupervisorRequest::Forward(signal)) => {
+                        forward_managed_signal(&owned, signal, &mut forwarded_signal);
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+            if forwarded_grace_deadline.is_some_and(|grace| Instant::now() >= grace)
+                && owned.has_child()
+                && forwarded_signal
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.escalation.is_none())
+            {
+                let escalation = signal_group(&owned);
+                signal = escalation.clone();
+                if let Some(evidence) = &mut forwarded_signal {
+                    evidence.escalation = Some(escalation);
                 }
             }
         }
@@ -329,6 +367,7 @@ mod unix {
             leader_status: status,
             elapsed: Some(started.elapsed()),
             signal,
+            forwarded_signal,
             reap: LeaderReapOutcome {
                 disposition: reap_disposition,
                 failures: observations.reap_failures,
@@ -340,10 +379,34 @@ mod unix {
         classify_managed(primary, program, execution.duration(), evidence)
     }
 
-    fn cancellation_received(cancel: &Receiver<()>) -> bool {
-        match cancel.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => true,
-            Err(TryRecvError::Empty) => false,
+    fn receive_managed_request(
+        request: &Receiver<SupervisorRequest>,
+        owned: &OwnedChild,
+        observations: &mut Observations,
+        forwarded_signal: &mut Option<ForwardedSignalEvidence>,
+    ) {
+        match request.try_recv() {
+            Ok(SupervisorRequest::Cancel) | Err(TryRecvError::Disconnected) => {
+                observations.cancelled = true;
+            }
+            Ok(SupervisorRequest::Forward(signal)) => {
+                forward_managed_signal(owned, signal, forwarded_signal);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn forward_managed_signal(
+        owned: &OwnedChild,
+        signal: crate::ForwardedSignal,
+        forwarded_signal: &mut Option<ForwardedSignalEvidence>,
+    ) {
+        if forwarded_signal.is_none() {
+            *forwarded_signal = Some(ForwardedSignalEvidence {
+                signal,
+                outcome: signal_group_with(owned, forwarded_signal_to_os(signal)),
+                escalation: None,
+            });
         }
     }
 
@@ -496,6 +559,7 @@ mod unix {
             leader_status: status,
             elapsed: Some(elapsed),
             signal,
+            forwarded_signal: None,
             reap: LeaderReapOutcome {
                 disposition: reap_disposition,
                 failures: observations.reap_failures,
@@ -525,7 +589,11 @@ mod unix {
     }
 
     fn signal_group(owned: &OwnedChild) -> GroupSignalOutcome {
-        match owned.signal_group() {
+        signal_group_with(owned, Signal::KILL)
+    }
+
+    fn signal_group_with(owned: &OwnedChild, signal: Signal) -> GroupSignalOutcome {
+        match owned.signal_group(signal) {
             Ok(()) => GroupSignalOutcome::Sent,
             Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
                 GroupSignalOutcome::AlreadyGone
@@ -533,6 +601,15 @@ mod unix {
             Err(error) => {
                 GroupSignalOutcome::Failed(FailureEvidence::from_io("signal process group", &error))
             }
+        }
+    }
+
+    fn forwarded_signal_to_os(signal: crate::ForwardedSignal) -> Signal {
+        match signal {
+            crate::ForwardedSignal::Hangup => Signal::HUP,
+            crate::ForwardedSignal::Interrupt => Signal::INT,
+            crate::ForwardedSignal::Terminate => Signal::TERM,
+            _ => Signal::TERM,
         }
     }
 
@@ -816,6 +893,7 @@ mod unix {
             leader_status: None,
             elapsed: None,
             signal: GroupSignalOutcome::Unknown,
+            forwarded_signal: None,
             reap: LeaderReapOutcome {
                 disposition: LeaderReapDisposition::Unknown,
                 failures: Vec::new(),
@@ -1030,8 +1108,8 @@ mod unix {
             self.child.is_some()
         }
 
-        fn signal_group(&self) -> std::io::Result<()> {
-            kill_process_group(self.pgid, Signal::KILL).map_err(errno_to_io)
+        fn signal_group(&self, signal: Signal) -> std::io::Result<()> {
+            kill_process_group(self.pgid, signal).map_err(errno_to_io)
         }
 
         fn leader_waitable(&self) -> std::io::Result<bool> {
@@ -1255,6 +1333,7 @@ mod unix {
                 leader_status: Some(status),
                 elapsed: Some(Duration::from_millis(1)),
                 signal: GroupSignalOutcome::Sent,
+                forwarded_signal: None,
                 reap: LeaderReapOutcome {
                     disposition: LeaderReapDisposition::Reaped,
                     failures: Vec::new(),

@@ -98,9 +98,10 @@ package, release manifest, README marker, and machine-state marker. Ordinary
 verification requires the selected tag to be an ancestor of `HEAD`.
 Prospective verification requires an authenticated Release Please PR, an
 explicit base ancestor of `HEAD`, the base tag on that ancestry, and all five
-facts changing together. The protected `gate / gate-attestation` context first
-runs that policy, then accepts only an exact prose-only skip or a successful
-hosted full Rust gate.
+facts changing together. Forge's protected `gate / gate-attestation` context
+first runs that policy, then accepts only an exact prose-only skip or a
+successful native full Rust gate. GitHub mirrors release automation and
+security scanning only; it is not the merge authority.
 
 The synchronous default and additive `async` feature must implement the same
 policy and lifecycle semantics. Async support may add runtime dependencies only

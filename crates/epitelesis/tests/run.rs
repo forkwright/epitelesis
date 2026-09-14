@@ -19,9 +19,11 @@ use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
 use epitelesis::{
-    CLEANUP_ALLOWANCE, CaptureCompleteness, CapturePolicy, CleanupOutcome, Command,
-    DEFAULT_CAPTURE_LIMIT, EnvironmentPolicy, Error, PolicyViolation, StreamName, output, run,
+    CLEANUP_ALLOWANCE, CaptureCompleteness, CapturePolicy, ChildSignalMask, CleanupOutcome,
+    Command, DEFAULT_CAPTURE_LIMIT, EnvironmentPolicy, Error, PolicyViolation, StreamName, output,
+    run,
 };
+use nix::sys::signal::{SigSet, Signal};
 
 trait Must<T> {
     fn must(self, context: &str) -> T;
@@ -86,6 +88,52 @@ fn clean_environment_is_the_actual_default() {
         output.evidence.stdout.captured.completeness,
         CaptureCompleteness::Complete
     );
+}
+
+/// A temporary parent signal block must not become an implicit child policy.
+/// The exact mask captured before the block is restored by Epitelesis during
+/// spawn, before the program observes its process state.
+#[test]
+fn child_signal_mask_is_restored_before_exec() {
+    let original = SigSet::thread_get_mask().must("current thread signal mask is available");
+    let _restore = SignalMaskRestore(original);
+    let child_mask = ChildSignalMask::capture_current().must("child mask captures");
+    let mut temporary_block = SigSet::empty();
+    for signal in [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM] {
+        temporary_block.add(signal);
+    }
+    temporary_block
+        .thread_block()
+        .must("parent blocks termination signals after capture");
+
+    let output = run(Command::new("/bin/sh")
+        .args([
+            "-c",
+            "while IFS=: read -r key value; do [ \"$key\" = SigBlk ] && { printf '%s\\n' \"$value\"; exit; }; done < /proc/self/status",
+        ])
+        .child_signal_mask(child_mask)
+        .deadline(Duration::from_secs(2))
+        .must("deadline is valid"))
+    .must("child inherits captured rather than temporary mask");
+    let output = String::from_utf8(output.evidence.stdout.captured.bytes)
+        .must("signal mask output is UTF-8");
+    let actual = u64::from_str_radix(output.trim(), 16).must("signal mask is hexadecimal");
+    for signal in [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM] {
+        let bit = 1_u64 << (signal as u32 - 1);
+        assert_eq!(
+            actual & bit != 0,
+            original.contains(signal),
+            "child did not retain the caller mask for {signal}"
+        );
+    }
+}
+
+struct SignalMaskRestore(SigSet);
+
+impl Drop for SignalMaskRestore {
+    fn drop(&mut self) {
+        let _ = self.0.thread_set_mask();
+    }
 }
 
 #[test]

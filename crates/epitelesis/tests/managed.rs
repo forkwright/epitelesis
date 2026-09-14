@@ -18,7 +18,10 @@ use std::fmt::Debug;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use epitelesis::{CLEANUP_ALLOWANCE, Command, Error, ManagedPoll, spawn_managed};
+use epitelesis::{
+    CLEANUP_ALLOWANCE, Command, Error, ForwardedSignal, GroupSignalOutcome, ManagedPoll,
+    spawn_managed,
+};
 
 trait Must<T> {
     fn must(self, context: &str) -> T;
@@ -120,6 +123,36 @@ fn managed_wait_closes_retained_piped_stdin() {
     stdout.read_to_end(&mut bytes).must("stdout reaches EOF");
     assert!(output.success());
     assert_eq!(bytes, b"eof");
+}
+
+#[test]
+fn managed_signal_request_forwards_without_exposing_the_process_group() {
+    let child = spawn_managed(
+        Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done"])
+            .deadline(Duration::from_secs(30))
+            .must("deadline is valid")
+            .streaming()
+            .must("streaming policy is valid"),
+    )
+    .must("managed child spawns");
+    child
+        .signal_requester()
+        .forward(ForwardedSignal::Terminate)
+        .must("supervisor accepts a forwarded SIGTERM request");
+
+    match child.wait() {
+        Err(Error::NonZeroExit { evidence, .. }) => {
+            let forwarded = evidence
+                .forwarded_signal
+                .as_ref()
+                .must("forwarded signal is retained in lifecycle evidence");
+            assert_eq!(forwarded.signal, ForwardedSignal::Terminate);
+            assert!(matches!(forwarded.outcome, GroupSignalOutcome::Sent));
+            assert!(forwarded.escalation.is_none());
+        }
+        other => panic!("expected the forwarded signal to terminate the child, got {other:?}"),
+    }
 }
 
 #[test]

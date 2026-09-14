@@ -44,6 +44,7 @@ pub async fn spawn(command: Command<Ready>) -> Result<Output> {
                 leader_status: None,
                 elapsed: None,
                 signal: GroupSignalOutcome::Unknown,
+                forwarded_signal: None,
                 reap: LeaderReapOutcome {
                     disposition: LeaderReapDisposition::Unknown,
                     failures: Vec::new(),

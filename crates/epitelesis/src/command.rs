@@ -46,6 +46,17 @@ pub struct Command<State = Draft> {
     pub(crate) stderr: Option<Stdio>,
     pub(crate) stdout_capture: CapturePolicy,
     pub(crate) stderr_capture: CapturePolicy,
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
+    pub(crate) child_signal_mask: Option<crate::ChildSignalMask>,
     state: State,
 }
 
@@ -64,6 +75,17 @@ impl Command<Draft> {
             stderr: None,
             stdout_capture: CapturePolicy::default(),
             stderr_capture: CapturePolicy::default(),
+            #[cfg(all(
+                unix,
+                not(any(
+                    target_os = "cygwin",
+                    target_os = "horizon",
+                    target_os = "openbsd",
+                    target_os = "redox",
+                    target_os = "wasi"
+                ))
+            ))]
+            child_signal_mask: None,
             state: Draft,
         }
     }
@@ -94,6 +116,17 @@ impl<State> Command<State> {
             stderr: self.stderr,
             stdout_capture: self.stdout_capture,
             stderr_capture: self.stderr_capture,
+            #[cfg(all(
+                unix,
+                not(any(
+                    target_os = "cygwin",
+                    target_os = "horizon",
+                    target_os = "openbsd",
+                    target_os = "redox",
+                    target_os = "wasi"
+                ))
+            ))]
+            child_signal_mask: self.child_signal_mask,
             state,
         }
     }
@@ -229,6 +262,28 @@ impl<State> Command<State> {
         self
     }
 
+    /// Restore this exact mask in the child before it executes the program.
+    ///
+    /// The caller may block signals in its own thread while establishing an
+    /// observer, then attach the mask captured before that block. The single
+    /// Epitelesis spawn owner applies it before `exec`; callers never receive
+    /// a raw child or a post-fork callback.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
+    #[must_use]
+    pub fn child_signal_mask(mut self, mask: crate::ChildSignalMask) -> Self {
+        self.child_signal_mask = Some(mask);
+        self
+    }
+
     /// Borrow the configured program path.
     #[must_use]
     pub fn program(&self) -> &Path {
@@ -342,7 +397,8 @@ impl std::fmt::Debug for StreamingCommand {
 
 impl<State: std::fmt::Debug> std::fmt::Debug for Command<State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Command")
+        let mut debug = f.debug_struct("Command");
+        debug
             .field("program", &self.program)
             .field("args", &self.args)
             .field("environment", &self.environment)
@@ -352,9 +408,22 @@ impl<State: std::fmt::Debug> std::fmt::Debug for Command<State> {
             .field("stdout", &self.stdout.as_ref().map(|_| "configured"))
             .field("stderr", &self.stderr.as_ref().map(|_| "configured"))
             .field("stdout_capture", &self.stdout_capture)
-            .field("stderr_capture", &self.stderr_capture)
-            .field("state", &self.state)
-            .finish()
+            .field("stderr_capture", &self.stderr_capture);
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        ))]
+        debug.field(
+            "child_signal_mask",
+            &self.child_signal_mask.as_ref().map(|_| "configured"),
+        );
+        debug.field("state", &self.state).finish()
     }
 }
 
@@ -381,6 +450,17 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
         stderr,
         stdout_capture,
         stderr_capture,
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        ))]
+        child_signal_mask,
         state,
     } = command;
     let program_display = program.display().to_string();
@@ -430,6 +510,9 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
     {
         use std::os::unix::process::CommandExt as _;
         process.process_group(0);
+        if let Some(mask) = child_signal_mask {
+            configure_child_signal_mask(&mut process, mask);
+        }
     }
 
     Ok(PreparedCommand {
@@ -439,6 +522,31 @@ pub(crate) fn prepare(command: Command<Ready>) -> Result<PreparedCommand> {
         stdout_capture,
         stderr_capture,
     })
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+#[expect(
+    unsafe_code,
+    reason = "only the command substrate may use the async-signal-safe child mask restoration needed between fork and exec"
+)]
+fn configure_child_signal_mask(process: &mut StdCommand, mask: crate::ChildSignalMask) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: this runs only in the child between fork and exec. It calls
+    // POSIX signal-mask restoration with an owned, precomputed mask; it
+    // performs no allocation, locking, or Rust runtime work.
+    unsafe {
+        process.pre_exec(move || mask.apply_in_child());
+    }
 }
 
 fn validate_path_policy<State>(command: &Command<State>) -> Result<()> {

@@ -19,6 +19,29 @@ pub enum GroupSignalOutcome {
     Unknown,
 }
 
+/// Catchable Unix termination signals a managed supervisor may forward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ForwardedSignal {
+    /// Forward SIGHUP to the owned process group.
+    Hangup,
+    /// Forward SIGINT to the owned process group.
+    Interrupt,
+    /// Forward SIGTERM to the owned process group.
+    Terminate,
+}
+
+/// Evidence for a caller-originated signal and any bounded forced escalation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForwardedSignalEvidence {
+    /// Signal selected by the caller.
+    pub signal: ForwardedSignal,
+    /// Outcome of delivering that signal to the owned process group.
+    pub outcome: GroupSignalOutcome,
+    /// Later SIGKILL result when the group did not settle during its grace period.
+    pub escalation: Option<GroupSignalOutcome>,
+}
+
 /// Final ownership disposition of the leader reap obligation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -171,6 +194,8 @@ pub struct LifecycleEvidence {
     pub elapsed: Option<Duration>,
     /// Actual result of signaling the owned process group.
     pub signal: GroupSignalOutcome,
+    /// Caller-originated signal delivery and any forced escalation.
+    pub forwarded_signal: Option<ForwardedSignalEvidence>,
     /// Actual leader reap disposition and failures.
     pub reap: LeaderReapOutcome,
     /// Stdout report, always ordered before stderr.

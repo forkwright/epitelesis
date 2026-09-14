@@ -28,6 +28,9 @@ tokio = { workspace = true, optional = true }
 # and fs supplies safe fcntl nonblocking setup. Unsupported waitid targets do
 # not acquire rustix and return a typed capability error before spawn.
 rustix = { version = "1.1", default-features = false, features = ["event", "fs", "process", "std"] }
+# WHY: captures and restores an exact caller signal mask in Epitelesis's
+# child-side spawn hook, so consumers never need an unsafe post-fork callback.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 # WHY: tempfile-backed scratch directories let cwd/env tests exercise real

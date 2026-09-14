@@ -82,9 +82,10 @@ them.
 
 Release truth has five synchronized files: `Cargo.toml`, the local
 `epitelesis` package in `Cargo.lock`, `.release-please-manifest.json`, the README
-dependency marker, and `_llm/current_state.toml`. The protected
+dependency marker, and `_llm/current_state.toml`. Forge's protected
 `gate / gate-attestation` context verifies them before allowing either the
-exact prose-only exemption or a successful hosted Rust build.
+exact prose-only exemption or a successful native Rust build. GitHub carries
+provider release automation and security scanning only.
 
 ## Cargo features
 

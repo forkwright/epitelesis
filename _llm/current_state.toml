@@ -13,7 +13,7 @@ source_docs = [
 [state]
 release_version = "0.4.1" # x-release-please-version
 release_status = "The workspace, local lockfile package, manifest, README pin, machine state, and ancestral local tag agree."
-contract_status = "The breaking v1 invocation and supervisor contract is implemented and enforced on main, verified by the hosted full gate (gate / gate-attestation) on every merge."
+contract_status = "The breaking v1 invocation and supervisor contract is implemented and enforced on main, verified by Forge's native full gate (gate / gate-attestation) on every merge."
 updated = "2026-08-26"
 
 [state.v1_contract]
@@ -38,5 +38,6 @@ files = [
 
 [state.hosted_gate]
 protected_context = "gate / gate-attestation"
+authority = "Forge is canonical for review, merge, and gate attestation; GitHub is provider release/security automation only."
 policy = "Release verification runs before fail-closed path classification."
-build = "Only exact prose files skip; every code-affecting change requires the Ubuntu 24.04 full gate."
+build = "Only exact prose files skip; every code-affecting change requires Forge's native full gate."

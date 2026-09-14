@@ -59,10 +59,10 @@ cargo nextest run --workspace --all-features
 cargo test --workspace --all-features --doc
 ```
 
-Branch protection consumes the exact `gate / gate-attestation` context. The PR
-caller and local reusable preserve that name. The local reusable permits only
-the enumerated documentation-only exemption and otherwise runs the full gate on
-GitHub-hosted infrastructure.
+Forge is the canonical review, merge, and gate authority. Its native
+`gate / gate-attestation` context preserves the full Rust gate above, with only
+the enumerated documentation-only exemption. GitHub is a provider mirror for
+Release Please and security scanning; its builds never establish merge truth.
 
 ## Change discipline
 
