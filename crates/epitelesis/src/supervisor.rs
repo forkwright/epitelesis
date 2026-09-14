@@ -302,7 +302,8 @@ mod unix {
         );
         let mut status = None;
         let mut reap_disposition = LeaderReapDisposition::Unreaped;
-        while owned.has_child() && Instant::now() < cleanup_deadline {
+        let mut process_group_unsettled = true;
+        while (owned.has_child() || process_group_unsettled) && Instant::now() < cleanup_deadline {
             observe_leader(&owned, &mut observations);
             if observations.leader_waitable {
                 match owned.reap_waitable() {
@@ -317,6 +318,15 @@ mod unix {
                         break;
                     }
                 }
+            }
+            if !owned.has_child() {
+                process_group_unsettled =
+                    owned
+                        .has_living_process_group_member()
+                        .unwrap_or_else(|failure| {
+                            observations.reap_failures.push(failure);
+                            true
+                        });
             }
             if owned.has_child() {
                 let wait = cleanup_deadline
@@ -333,7 +343,7 @@ mod unix {
                 }
             }
             if forwarded_grace_deadline.is_some_and(|grace| Instant::now() >= grace)
-                && owned.has_child()
+                && (owned.has_child() || process_group_unsettled)
                 && forwarded_signal
                     .as_ref()
                     .is_some_and(|evidence| evidence.escalation.is_none())
@@ -353,10 +363,11 @@ mod unix {
                 Err(failure) => observations.reap_failures.push(failure),
             }
         }
-        let cleanup = if leader_unsettled {
+        let cleanup = if leader_unsettled || process_group_unsettled {
             CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
                 unfinished_streams: Vec::new(),
-                leader_unsettled: true,
+                leader_unsettled,
+                process_group_unsettled,
                 cleanup_budget: CLEANUP_BUDGET,
             })
         } else {
@@ -491,6 +502,7 @@ mod unix {
         let signal = signal_group(&owned);
         let mut status = None;
         let mut reap_disposition = LeaderReapDisposition::Unreaped;
+        let mut process_group_unsettled = true;
         while Instant::now() < cleanup_deadline {
             observations.cancelled |= cancellation.is_cancelled();
             observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
@@ -509,7 +521,20 @@ mod unix {
                     }
                 }
             }
-            if !owned.has_child() && stdout.terminal() && stderr.terminal() {
+            if !owned.has_child() {
+                process_group_unsettled =
+                    owned
+                        .has_living_process_group_member()
+                        .unwrap_or_else(|failure| {
+                            observations.reap_failures.push(failure);
+                            true
+                        });
+            }
+            if !owned.has_child()
+                && !process_group_unsettled
+                && stdout.terminal()
+                && stderr.terminal()
+            {
                 break;
             }
             let wait = wait_quantum(None, Some(cleanup_deadline));
@@ -542,15 +567,17 @@ mod unix {
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        let cleanup = if leader_unsettled || !unfinished_streams.is_empty() {
-            CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
-                unfinished_streams,
-                leader_unsettled,
-                cleanup_budget: CLEANUP_BUDGET,
-            })
-        } else {
-            CleanupOutcome::Complete
-        };
+        let cleanup =
+            if leader_unsettled || process_group_unsettled || !unfinished_streams.is_empty() {
+                CleanupOutcome::Incomplete(CleanupIncompleteEvidence {
+                    unfinished_streams,
+                    leader_unsettled,
+                    process_group_unsettled,
+                    cleanup_budget: CLEANUP_BUDGET,
+                })
+            } else {
+                CleanupOutcome::Complete
+            };
         let stdout_overflow = stdout.overflow();
         let stderr_overflow = stderr.overflow();
         let primary = choose_primary(&mut observations, stdout_overflow, stderr_overflow);
@@ -1155,6 +1182,90 @@ mod unix {
                 ));
             }
             Ok(())
+        }
+
+        /// Prove that no living process can still use resources scoped to
+        /// this child-led process group. This is intentionally stricter than
+        /// checking whether the leader was reaped: background descendants can
+        /// survive their shell leader. Linux `/proc` is the supported source
+        /// for that proof. On another platform the supervisor reports
+        /// incomplete cleanup rather than guessing from a successful kill.
+        fn has_living_process_group_member(&self) -> std::result::Result<bool, FailureEvidence> {
+            #[cfg(target_os = "linux")]
+            {
+                let entries = std::fs::read_dir("/proc").map_err(|source| {
+                    FailureEvidence::from_io("inspect process group liveness", &source)
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|source| {
+                        FailureEvidence::from_io("inspect process group liveness", &source)
+                    })?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse::<u32>().ok())
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let path = entry.path().join("stat");
+                    let stat = match std::fs::read_to_string(path) {
+                        Ok(stat) => stat,
+                        Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            return Err(FailureEvidence::from_io(
+                                "inspect process group liveness",
+                                &source,
+                            ));
+                        }
+                    };
+                    let Some((_, fields)) = stat.rsplit_once(") ") else {
+                        return Err(FailureEvidence::from_io(
+                            "inspect process group liveness",
+                            &std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "malformed proc stat",
+                            ),
+                        ));
+                    };
+                    let fields = fields.split_whitespace().collect::<Vec<_>>();
+                    let state = fields.first().copied().ok_or_else(|| {
+                        FailureEvidence::from_io(
+                            "inspect process group liveness",
+                            &std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "proc stat omitted state",
+                            ),
+                        )
+                    })?;
+                    let group = fields
+                        .get(2)
+                        .and_then(|field| field.parse::<u32>().ok())
+                        .ok_or_else(|| {
+                            FailureEvidence::from_io(
+                                "inspect process group liveness",
+                                &std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "proc stat omitted process group",
+                                ),
+                            )
+                        })?;
+                    if group == self.pgid.as_raw() as u32 && state != "Z" {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Err(FailureEvidence::from_io(
+                    "inspect process group liveness",
+                    &std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "process-group liveness proof requires Linux /proc",
+                    ),
+                ))
+            }
         }
     }
 

@@ -63,6 +63,13 @@ pub struct CleanupIncompleteEvidence {
     /// Whether the leader was unsettled when the cleanup budget expired and
     /// background-reaper transfer began.
     pub leader_unsettled: bool,
+    /// Whether a living member of the owned process group remained, or the
+    /// platform could not prove that the group had no living members.
+    ///
+    /// Zombie members do not count here: they cannot retain open files or
+    /// write after termination, and their eventual reap belongs to their
+    /// parent (often PID 1), not this supervisor.
+    pub process_group_unsettled: bool,
     /// Shared cleanup budget that elapsed.
     pub cleanup_budget: Duration,
 }

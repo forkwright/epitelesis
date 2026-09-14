@@ -19,8 +19,8 @@ use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 use epitelesis::{
-    CLEANUP_ALLOWANCE, Command, Error, ForwardedSignal, GroupSignalOutcome, ManagedPoll,
-    spawn_managed,
+    CLEANUP_ALLOWANCE, CleanupOutcome, Command, Error, ForwardedSignal, GroupSignalOutcome,
+    ManagedPoll, spawn_managed,
 };
 
 trait Must<T> {
@@ -153,6 +153,57 @@ fn managed_signal_request_forwards_without_exposing_the_process_group() {
         }
         other => panic!("expected the forwarded signal to terminate the child, got {other:?}"),
     }
+}
+
+/// A forwarded catchable signal gets a grace interval, then the same owned
+/// supervisor escalates the complete process group before returning. The
+/// descendant deliberately ignores TERM, so leader reap alone would make
+/// this test pass while leaving a live writer behind.
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_signal_waits_for_ignoring_descendant_before_settlement() {
+    let directory = tempfile::tempdir().must("scratch directory");
+    let pidfile = directory.path().join("ignoring-descendant.pid");
+    let script = format!(
+        "sh -c 'trap \"\" TERM; echo $$ > {}; while :; do sleep 1; done' & wait",
+        pidfile.display()
+    );
+    let child = spawn_managed(
+        Command::new("/bin/sh")
+            .args(["-c", &script])
+            .deadline(Duration::from_secs(30))
+            .must("deadline is valid")
+            .streaming()
+            .must("streaming policy is valid"),
+    )
+    .must("managed child spawns");
+    let pid = wait_for_pid(&pidfile);
+    let started = Instant::now();
+    child
+        .signal_requester()
+        .forward(ForwardedSignal::Terminate)
+        .must("supervisor accepts a forwarded SIGTERM request");
+
+    match child.wait() {
+        Err(Error::NonZeroExit { evidence, .. }) => {
+            let forwarded = evidence
+                .forwarded_signal
+                .as_ref()
+                .must("forwarded signal evidence is retained");
+            assert!(matches!(forwarded.outcome, GroupSignalOutcome::Sent));
+            assert!(
+                matches!(forwarded.escalation, Some(GroupSignalOutcome::Sent)),
+                "an ignoring descendant requires SIGKILL escalation: {forwarded:?}"
+            );
+            assert!(matches!(evidence.cleanup, CleanupOutcome::Complete));
+        }
+        other => panic!("expected forwarded signal to terminate managed group, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "settlement must include the forwarded-signal grace interval"
+    );
+    wait_until_gone(pid);
 }
 
 #[test]
