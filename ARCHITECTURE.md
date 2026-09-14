@@ -40,8 +40,8 @@ Exactly one supervisor owns each running invocation. It owns:
 - construction of a single evidence-bearing result.
 
 Each ready pipe receives a bounded byte/chunk turn before control checks resume.
-There are no capture reader threads. Cleanup is part of the result, not
-best-effort work after it. One two-second internal cleanup deadline owns group
+Capture stays in the supervisor's poll loop. Cleanup contributes to the result.
+One two-second internal cleanup deadline owns group
 signal, non-reaping leader observation, reap, and pipe settlement. The public
 allowance is 2.1 seconds. If the leader remains unsettled, the supervisor
 attempts to transfer its `Child` to the named background reaper; typed reap
