@@ -287,13 +287,7 @@ mod unix {
         let mut process_group_unsettled = true;
         while (owned.has_child() || process_group_unsettled) && Instant::now() < cleanup_deadline {
             observe_leader(&owned, &mut observations);
-            process_group_unsettled =
-                owned
-                    .has_living_process_group_member()
-                    .unwrap_or_else(|failure| {
-                        observations.reap_failures.push(failure);
-                        true
-                    });
+            process_group_unsettled = process_group_is_unsettled(&owned, &mut observations);
             if forwarded_grace_deadline.is_some_and(|grace| Instant::now() >= grace)
                 && process_group_unsettled
                 && forwarded_signal
@@ -325,13 +319,7 @@ mod unix {
                         observations.leader_waitable = false;
                     }
                 }
-                process_group_unsettled =
-                    owned
-                        .has_living_process_group_member()
-                        .unwrap_or_else(|failure| {
-                            observations.reap_failures.push(failure);
-                            true
-                        });
+                process_group_unsettled = process_group_is_unsettled(&owned, &mut observations);
             }
             if !owned.has_child() && !process_group_unsettled {
                 break;
@@ -380,6 +368,15 @@ mod unix {
             cleanup,
         });
         classify_managed(primary, program, execution.duration(), evidence)
+    }
+
+    fn process_group_is_unsettled(owned: &OwnedChild, observations: &mut Observations) -> bool {
+        owned
+            .has_living_process_group_member()
+            .unwrap_or_else(|failure| {
+                observations.reap_failures.push(failure);
+                true
+            })
     }
 
     fn await_managed_settlement(
@@ -560,13 +557,7 @@ mod unix {
                 }
             }
             if !owned.has_child() {
-                process_group_unsettled =
-                    owned
-                        .has_living_process_group_member()
-                        .unwrap_or_else(|failure| {
-                            observations.reap_failures.push(failure);
-                            true
-                        });
+                process_group_unsettled = process_group_is_unsettled(&owned, &mut observations);
             }
             if !owned.has_child()
                 && !process_group_unsettled
