@@ -1,7 +1,6 @@
 //! Bounded capture storage and nonblocking pipe pumping for the Unix supervisor.
 
 use std::io::Read;
-use std::os::fd::AsFd;
 use std::process::{ChildStderr, ChildStdout};
 use std::thread;
 use std::time::Duration;

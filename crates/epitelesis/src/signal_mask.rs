@@ -24,5 +24,5 @@ impl ChildSignalMask {
 }
 
 fn io_error(source: nix::errno::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(i32::from(source))
+    std::io::Error::from(source)
 }

@@ -1,8 +1,11 @@
 //! Unix supervisor unit coverage.
 
-use super::*;
+use std::io::Read;
 
+use super::evidence::Primary;
 use super::*;
+use crate::error::CaptureFailure;
+use crate::policy::CapturePolicy;
 
 #[test]
 fn primary_precedence_is_stable() {

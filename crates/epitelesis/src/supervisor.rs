@@ -124,28 +124,27 @@ pub(crate) fn spawn_managed(command: StreamingCommand) -> Result<ManagedLaunch> 
     ))
 ))]
 mod unix {
-    use std::process::{Child, ExitStatus};
+    use std::process::ExitStatus;
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+    use rustix::process::Signal;
     use snafu::IntoError as _;
 
     use super::{CLEANUP_BUDGET, Cancellation, ManagedLaunch, SupervisorRequest};
     use crate::command::PreparedCommand;
     use crate::error::{
-        CancelledSnafu, CaptureFailedSnafu, CaptureFailure, CaptureLimitExceededSnafu,
-        CleanupIncompleteEvidence, CleanupIncompleteSnafu, FailureEvidence, LifecycleFailedSnafu,
-        NonZeroExitSnafu, ReaperStartFailedSnafu, Result, SpawnFailedSnafu, SupervisionFailedSnafu,
-        SupervisorStartFailedSnafu, TimeoutSnafu,
+        CancelledSnafu, CaptureFailedSnafu, CaptureLimitExceededSnafu, CleanupIncompleteEvidence,
+        CleanupIncompleteSnafu, FailureEvidence, LifecycleFailedSnafu, NonZeroExitSnafu, Result,
+        SpawnFailedSnafu, SupervisionFailedSnafu, SupervisorStartFailedSnafu, TimeoutSnafu,
     };
     use crate::output::{
         CaptureReport, CapturedStream, CleanupOutcome, ForwardedSignalEvidence, GroupSignalOutcome,
         LeaderReapDisposition, LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output,
         StreamName,
     };
-    use crate::policy::{CapturePolicy, ExecutionPolicy, OverflowBehavior};
+    use crate::policy::ExecutionPolicy;
 
     const EVENT_QUANTUM: Duration = Duration::from_millis(10);
 
