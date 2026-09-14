@@ -34,6 +34,7 @@ pub enum ForwardedSignal {
 /// Evidence for a caller-originated signal and any bounded forced escalation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForwardedSignalEvidence {
+    // kanon:ignore TOPOLOGY/shallow-struct -- immutable observed signal evidence; interpretation remains with caller
     /// Signal selected by the caller.
     pub signal: ForwardedSignal,
     /// Outcome of delivering that signal to the owned process group.
@@ -59,6 +60,7 @@ pub enum LeaderReapDisposition {
 /// Typed reap disposition plus every failure encountered while settling it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaderReapOutcome {
+    // kanon:ignore TOPOLOGY/shallow-struct -- immutable observed reap evidence; interpretation remains with caller
     /// Final owner/disposition of the reap obligation.
     pub disposition: LeaderReapDisposition,
     /// Wait or background-reaper creation failures in observation order.
@@ -162,6 +164,7 @@ impl CapturedStream {
 /// Deterministic report for one capture stream.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CaptureReport {
+    // kanon:ignore TOPOLOGY/shallow-struct -- immutable observed capture evidence; interpretation remains with caller
     /// Stream this report describes.
     pub stream: StreamName,
     /// Prefix and completeness evidence retained by the supervisor.

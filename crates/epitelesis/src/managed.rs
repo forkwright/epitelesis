@@ -320,7 +320,7 @@ mod tests {
             "detached supervisor did not finish"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
+            elapsed < std::time::Duration::from_secs(1), // kanon:ignore TESTING/wall-clock-assertion -- drop's bounded cleanup contract must return before the retained supervisor's one-second fixture release; settlement is asserted below
             "drop blocked for {elapsed:?}"
         );
     }

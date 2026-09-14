@@ -58,6 +58,7 @@ pub enum CaptureFailure {
 /// Evidence that the shared cleanup deadline expired before full settlement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupIncompleteEvidence {
+    // kanon:ignore TOPOLOGY/shallow-struct -- immutable observed cleanup evidence; interpretation remains with caller
     /// Streams whose pipes did not reach EOF.
     pub unfinished_streams: Vec<StreamName>,
     /// Whether the leader was unsettled when the cleanup budget expired and
