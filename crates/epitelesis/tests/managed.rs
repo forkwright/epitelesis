@@ -347,8 +347,7 @@ fn typed_error_exposes_execution_evidence_without_treating_refusal_as_execution(
     let failed = Command::new("/bin/sh")
         .args(["-c", "printf diagnostic >&2; exit 7"])
         .deadline(Duration::from_secs(5))
-        .must("valid deadline")
-        .output()
+        .and_then(epitelesis::run)
         .err()
         .must("command exit remains an error");
     let evidence = failed
