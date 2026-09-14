@@ -2,7 +2,11 @@
 
 use std::io::Read;
 use std::os::fd::AsFd;
+use std::process::{ChildStderr, ChildStdout};
+use std::thread;
+use std::time::Duration;
 
+use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::error::CaptureFailure;
@@ -10,6 +14,7 @@ use crate::output::{CaptureReport, CapturedStream, StreamName};
 use crate::policy::{CapturePolicy, OverflowBehavior};
 
 const READ_CHUNK: usize = 8 * 1024;
+const CHUNKS_PER_STREAM_TURN: usize = 8;
 
 pub(super) struct CaptureStream<Pipe> {
     name: StreamName,
@@ -78,7 +83,16 @@ impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
                     self.pipe = None;
                     return;
                 }
-                Ok(count) => self.retain(&chunk[..count]),
+                Ok(count) => match chunk.get(..count) {
+                    Some(captured) => self.retain(captured),
+                    None => {
+                        self.record_failure(&std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "pipe reported a read length beyond its supplied buffer",
+                        ));
+                        return;
+                    }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(error) => {
@@ -113,7 +127,7 @@ impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
                 }
                 if retained > 0 {
                     if bytes.try_reserve(retained).is_ok() {
-                        bytes.extend_from_slice(&chunk[..retained]);
+                        bytes.extend(chunk.iter().take(retained).copied());
                     } else {
                         self.discarded = self.discarded.saturating_add(usize_to_u64(retained));
                         allocation_failed = true;
@@ -163,6 +177,82 @@ impl<Pipe: Read + std::os::fd::AsFd> CaptureStream<Pipe> {
             failure: self.failure,
         }
     }
+}
+
+pub(super) fn poll_streams(
+    stdout: &CaptureStream<ChildStdout>,
+    stderr: &CaptureStream<ChildStderr>,
+    timeout: Duration,
+) -> std::io::Result<(bool, bool)> {
+    let events = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
+    // The supervisor event quantum is below one second, so this also fits
+    // 32-bit c_long on supported Unix targets.
+    let nanoseconds = Nsecs::try_from(timeout.subsec_nanos()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "poll timeout nanoseconds exceed the platform timespec field",
+        )
+    })?;
+    let timespec = Timespec {
+        tv_sec: 0,
+        tv_nsec: nanoseconds,
+    };
+    match (stdout.pipe.as_ref(), stderr.pipe.as_ref()) {
+        (Some(stdout_pipe), Some(stderr_pipe)) => {
+            let mut descriptors = [
+                PollFd::new(stdout_pipe, events),
+                PollFd::new(stderr_pipe, events),
+            ];
+            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            Ok((
+                poll_ready(descriptors.first()),
+                poll_ready(descriptors.get(1)),
+            ))
+        }
+        (Some(stdout_pipe), None) => {
+            let mut descriptors = [PollFd::new(stdout_pipe, events)];
+            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            Ok((poll_ready(descriptors.first()), false))
+        }
+        (None, Some(stderr_pipe)) => {
+            let mut descriptors = [PollFd::new(stderr_pipe, events)];
+            poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
+            Ok((false, poll_ready(descriptors.first())))
+        }
+        (None, None) => {
+            thread::sleep(timeout);
+            Ok((false, false))
+        }
+    }
+}
+
+pub(super) fn pump_fair(
+    stdout: &mut CaptureStream<ChildStdout>,
+    stderr: &mut CaptureStream<ChildStderr>,
+    stdout_ready: bool,
+    stderr_ready: bool,
+    stdout_first: &mut bool,
+) {
+    if *stdout_first {
+        if stdout_ready {
+            stdout.pump(CHUNKS_PER_STREAM_TURN);
+        }
+        if stderr_ready {
+            stderr.pump(CHUNKS_PER_STREAM_TURN);
+        }
+    } else {
+        if stderr_ready {
+            stderr.pump(CHUNKS_PER_STREAM_TURN);
+        }
+        if stdout_ready {
+            stdout.pump(CHUNKS_PER_STREAM_TURN);
+        }
+    }
+    *stdout_first = !*stdout_first;
+}
+
+fn poll_ready(descriptor: Option<&PollFd<'_>>) -> bool {
+    descriptor.is_some_and(|descriptor| !descriptor.revents().is_empty())
 }
 
 fn usize_to_u64(value: usize) -> u64 {

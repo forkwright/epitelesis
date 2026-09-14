@@ -13,9 +13,20 @@ pub(super) fn start_background_reaper(program: &str) -> Result<mpsc::SyncSender<
     let (sender, receiver) = mpsc::sync_channel::<Child>(1);
     let _reaper = thread::Builder::new()
         .name("epitelesis-background-reaper".to_owned())
-        .spawn(move || {
-            if let Ok(mut child) = receiver.recv() {
-                let _ = child.wait();
+        .spawn(move || match receiver.recv() {
+            Ok(mut child) => {
+                if let Err(error) = child.wait() {
+                    tracing::error!(
+                        %error,
+                        "background reaper could not reap the transferred process leader"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "background reaper stopped before receiving process ownership"
+                );
             }
         })
         .map_err(|source| {
@@ -178,7 +189,10 @@ impl OwnedChild {
                             ),
                         )
                     })?;
-                if group == self.pgid.as_raw_pid() as u32 && state != "Z" {
+                let same_group = u32::try_from(self.pgid.as_raw_pid())
+                    .ok()
+                    .is_some_and(|pgid| group == pgid);
+                if same_group && state != "Z" {
                     return Ok(true);
                 }
             }
@@ -203,8 +217,18 @@ impl Drop for OwnedChild {
         if self.child.is_none() {
             return;
         }
-        let _ = kill_process_group(self.pgid, Signal::KILL);
-        let _ = self.handoff_to_background_reaper();
+        if let Err(error) = kill_process_group(self.pgid, Signal::KILL) {
+            tracing::error!(
+                %error,
+                "owned child dropped before process-group termination completed"
+            );
+        }
+        if let Err(failure) = self.handoff_to_background_reaper() {
+            tracing::error!(
+                ?failure,
+                "owned child dropped before background reaper handoff completed"
+            );
+        }
     }
 }
 

@@ -269,12 +269,26 @@ impl fmt::Display for PolicyViolation {
     }
 }
 
-pub(crate) fn validate_deadline(duration: Duration) -> Result<()> {
-    if duration == Duration::MAX || Instant::now().checked_add(duration).is_none() {
-        return InvalidPolicySnafu {
-            violation: PolicyViolation::DeadlineOverflow(duration),
+/// A duration proved representable in the current monotonic clock domain.
+///
+/// The public execution policy continues to expose its configured duration;
+/// this crate-private value prevents a validated deadline from being confused
+/// with arbitrary input while a command transitions from [`Draft`] to
+/// [`Ready`].
+pub(crate) struct ValidatedDeadline(Duration);
+
+impl ValidatedDeadline {
+    pub(crate) fn new(duration: Duration) -> Result<Self> {
+        if duration == Duration::MAX || Instant::now().checked_add(duration).is_none() {
+            return InvalidPolicySnafu {
+                violation: PolicyViolation::DeadlineOverflow(duration),
+            }
+            .fail();
         }
-        .fail();
+        Ok(Self(duration))
     }
-    Ok(())
+
+    pub(crate) fn into_duration(self) -> Duration {
+        self.0
+    }
 }

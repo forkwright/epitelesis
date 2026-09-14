@@ -82,7 +82,10 @@ fn managed_cancel_kills_background_descendant() {
     .must("managed child spawns");
     let pid = wait_for_pid(&pidfile);
     child.cancel().must("cancel settles and reaps");
-    wait_until_gone(pid);
+    assert!(
+        wait_until_gone(pid),
+        "cancel must remove the descendant from procfs"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -102,7 +105,10 @@ fn managed_drop_kills_background_descendant() {
     .must("managed child spawns");
     let pid = wait_for_pid(&pidfile);
     drop(child);
-    wait_until_gone(pid);
+    assert!(
+        wait_until_gone(pid),
+        "drop must remove the descendant from procfs"
+    );
 }
 
 #[test]
@@ -223,7 +229,10 @@ fn managed_signal_waits_for_ignoring_descendant_before_settlement() {
         started.elapsed() >= Duration::from_secs(1),
         "settlement must include the forwarded-signal grace interval"
     );
-    wait_until_gone(pid);
+    assert!(
+        wait_until_gone(pid),
+        "forwarded signal cleanup must remove the descendant from procfs"
+    );
 }
 
 #[test]
@@ -325,7 +334,7 @@ fn wait_for_pid(path: &std::path::Path) -> u32 {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_until_gone(pid: u32) {
+fn wait_until_gone(pid: u32) -> bool {
     let deadline = Instant::now() + Duration::from_secs(3);
     let proc_path = format!("/proc/{pid}");
     while std::path::Path::new(&proc_path).exists() {
@@ -335,6 +344,7 @@ fn wait_until_gone(pid: u32) {
         );
         std::thread::yield_now();
     }
+    !std::path::Path::new(&proc_path).exists()
 }
 
 #[test]

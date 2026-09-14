@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::error::{InvalidPolicySnafu, Result};
 use crate::policy::{
     CapturePolicy, Draft, EnvironmentPolicy, ExecutionPolicy, PolicyViolation, Ready,
-    validate_deadline,
+    ValidatedDeadline,
 };
 
 /// One environment mutation, replayed after the base environment policy.
@@ -92,8 +92,10 @@ impl Command<Draft> {
 
     /// Declare a bounded wall-clock lifetime and make the command runnable.
     pub fn deadline(self, duration: Duration) -> Result<Command<Ready>> {
-        validate_deadline(duration)?;
-        Ok(self.into_state(Ready::new(ExecutionPolicy::Deadline(duration))))
+        let deadline = ValidatedDeadline::new(duration)?;
+        Ok(self.into_state(Ready::new(ExecutionPolicy::Deadline(
+            deadline.into_duration(),
+        ))))
     }
 
     /// Intentionally permit an unbounded lifetime for a non-empty reason.

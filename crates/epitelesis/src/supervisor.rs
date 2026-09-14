@@ -124,14 +124,11 @@ pub(crate) fn spawn_managed(command: StreamingCommand) -> Result<ManagedLaunch> 
     ))
 ))]
 mod unix {
-    use std::io::Read;
-    use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
+    use std::process::{Child, ExitStatus};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use rustix::event::{Nsecs, PollFd, PollFlags, Timespec, poll};
-    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
     use snafu::IntoError as _;
 
@@ -151,7 +148,6 @@ mod unix {
     use crate::policy::{CapturePolicy, ExecutionPolicy, OverflowBehavior};
 
     const EVENT_QUANTUM: Duration = Duration::from_millis(10);
-    const CHUNKS_PER_STREAM_TURN: usize = 8;
 
     struct ManagedStartup {
         id: u32,
@@ -188,7 +184,12 @@ mod unix {
                 supervisor,
             }),
             Ok(Err(error)) => {
-                let _ = supervisor.join();
+                if supervisor.join().is_err() {
+                    tracing::error!(
+                        program = %program,
+                        "managed supervisor panicked after reporting its startup failure"
+                    );
+                }
                 Err(error)
             }
             Err(_) => {
@@ -224,7 +225,7 @@ mod unix {
         let reaper = match start_background_reaper(&program) {
             Ok(reaper) => reaper,
             Err(error) => {
-                let _ = startup.send(Err(error));
+                report_startup_failure(startup, error, &program);
                 return;
             }
         };
@@ -232,14 +233,21 @@ mod unix {
         let deadline = match execution.deadline(started) {
             Ok(deadline) => deadline,
             Err(error) => {
-                let _ = startup.send(Err(error));
+                report_startup_failure(startup, error, &program);
                 return;
             }
         };
         let child = match command.spawn() {
             Ok(child) => child,
             Err(source) => {
-                let _ = startup.send(Err(SpawnFailedSnafu { program }.into_error(source)));
+                report_startup_failure(
+                    startup,
+                    SpawnFailedSnafu {
+                        program: program.clone(),
+                    }
+                    .into_error(source),
+                    &program,
+                );
                 return;
             }
         };
@@ -251,12 +259,38 @@ mod unix {
             stderr: owned.child_mut().and_then(|child| child.stderr.take()),
         };
         if startup.send(Ok(startup_value)).is_err() {
-            let _ = owned.signal_group(Signal::KILL);
-            let _ = owned.handoff_to_background_reaper();
+            let outcome = signal_group(&owned);
+            tracing::warn!(
+                program = %program,
+                ?outcome,
+                "managed launcher disconnected; terminating the owned process group"
+            );
+            if let Err(failure) = owned.handoff_to_background_reaper() {
+                tracing::error!(
+                    program = %program,
+                    ?failure,
+                    "managed launcher disconnected before child reaper handoff"
+                );
+            }
             return;
         }
         let terminal = supervise_managed(owned, program, &execution, deadline, started, request);
-        let _ = result.send(terminal);
+        if result.send(terminal).is_err() {
+            tracing::debug!("managed result receiver disconnected after supervision settled");
+        }
+    }
+
+    fn report_startup_failure(
+        startup: &mpsc::SyncSender<Result<ManagedStartup>>,
+        error: crate::Error,
+        program: &str,
+    ) {
+        if startup.send(Err(error)).is_err() {
+            tracing::warn!(
+                program = %program,
+                "managed launcher disconnected before supervisor startup failure could be delivered"
+            );
+        }
     }
 
     fn supervise_managed(
@@ -691,72 +725,6 @@ mod unix {
         })
     }
 
-    fn poll_streams(
-        stdout: &CaptureStream<ChildStdout>,
-        stderr: &CaptureStream<ChildStderr>,
-        timeout: Duration,
-    ) -> std::io::Result<(bool, bool)> {
-        let events = PollFlags::IN | PollFlags::HUP | PollFlags::ERR;
-        // EVENT_QUANTUM is below one second, so this also fits 32-bit c_long.
-        let nanoseconds = timeout.subsec_nanos() as Nsecs;
-        let timespec = Timespec {
-            tv_sec: 0,
-            tv_nsec: nanoseconds,
-        };
-        match (stdout.pipe.as_ref(), stderr.pipe.as_ref()) {
-            (Some(stdout_pipe), Some(stderr_pipe)) => {
-                let mut descriptors = [
-                    PollFd::new(stdout_pipe, events),
-                    PollFd::new(stderr_pipe, events),
-                ];
-                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
-                Ok((
-                    !descriptors[0].revents().is_empty(),
-                    !descriptors[1].revents().is_empty(),
-                ))
-            }
-            (Some(stdout_pipe), None) => {
-                let mut descriptors = [PollFd::new(stdout_pipe, events)];
-                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
-                Ok((!descriptors[0].revents().is_empty(), false))
-            }
-            (None, Some(stderr_pipe)) => {
-                let mut descriptors = [PollFd::new(stderr_pipe, events)];
-                poll(&mut descriptors, Some(&timespec)).map_err(errno_to_io)?;
-                Ok((false, !descriptors[0].revents().is_empty()))
-            }
-            (None, None) => {
-                thread::sleep(timeout);
-                Ok((false, false))
-            }
-        }
-    }
-
-    fn pump_fair(
-        stdout: &mut CaptureStream<ChildStdout>,
-        stderr: &mut CaptureStream<ChildStderr>,
-        stdout_ready: bool,
-        stderr_ready: bool,
-        stdout_first: &mut bool,
-    ) {
-        if *stdout_first {
-            if stdout_ready {
-                stdout.pump(CHUNKS_PER_STREAM_TURN);
-            }
-            if stderr_ready {
-                stderr.pump(CHUNKS_PER_STREAM_TURN);
-            }
-        } else {
-            if stderr_ready {
-                stderr.pump(CHUNKS_PER_STREAM_TURN);
-            }
-            if stdout_ready {
-                stdout.pump(CHUNKS_PER_STREAM_TURN);
-            }
-        }
-        *stdout_first = !*stdout_first;
-    }
-
     #[path = "supervisor_evidence.rs"]
     mod evidence;
     use evidence::{
@@ -766,7 +734,7 @@ mod unix {
 
     #[path = "supervisor_capture.rs"]
     mod capture;
-    use capture::CaptureStream;
+    use capture::{CaptureStream, poll_streams, pump_fair};
 
     #[path = "supervisor_owned_child.rs"]
     mod owned_child;

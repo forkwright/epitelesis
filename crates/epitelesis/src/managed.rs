@@ -150,9 +150,19 @@ impl ManagedChild {
     /// A settled cancellation returns its aggregate evidence. Incomplete or
     /// failed cleanup remains an evidence-bearing terminal error.
     pub fn cancel(mut self) -> Result<Box<LifecycleEvidence>> {
-        let _ = self
+        if self
             .request
-            .send(crate::supervisor::SupervisorRequest::Cancel);
+            .send(crate::supervisor::SupervisorRequest::Cancel)
+            .is_err()
+        {
+            // The request channel can close after the supervisor has already
+            // entered terminal cleanup. Its result channel remains the
+            // authority for that terminal outcome.
+            tracing::debug!(
+                child_id = self.id,
+                "managed supervisor stopped accepting cancellation before wait"
+            );
+        }
         match self.wait_inner() {
             Ok(output) => Ok(output.evidence),
             Err(Error::Cancelled { evidence, .. }) if cancellation_settled(&evidence) => {
@@ -263,9 +273,16 @@ impl Drop for ManagedChild {
         }
         if self.result.is_none() {
             drop(self.stdin.take());
-            let _ = self
+            if self
                 .request
-                .send(crate::supervisor::SupervisorRequest::Cancel);
+                .send(crate::supervisor::SupervisorRequest::Cancel)
+                .is_err()
+            {
+                tracing::debug!(
+                    child_id = self.id,
+                    "managed child dropped after its supervisor stopped accepting cancellation"
+                );
+            }
         }
         drop(self.supervisor.take());
     }
