@@ -23,15 +23,6 @@ tracing = { workspace = true }
 # sync-only and don't pay the runtime cost or dep weight when unused.
 tokio = { workspace = true, optional = true }
 
-[target.'cfg(all(unix, not(any(target_os = "cygwin", target_os = "horizon", target_os = "openbsd", target_os = "redox", target_os = "wasi"))))'.dependencies]
-# WHY: process supplies waitid/process-group signaling, event supplies poll,
-# and fs supplies safe fcntl nonblocking setup. Unsupported waitid targets do
-# not acquire rustix and return a typed capability error before spawn.
-rustix = { version = "1.1", default-features = false, features = ["event", "fs", "process", "std"] }
-# WHY: captures and restores an exact caller signal mask in Epitelesis's
-# child-side spawn hook, so consumers never need an unsafe post-fork callback.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
-
 [dev-dependencies]
 # WHY: tempfile-backed scratch directories let cwd/env tests exercise real
 # filesystem state without polluting the worktree.
@@ -43,6 +34,20 @@ tokio = { workspace = true }
 # `Span::current()` observable, and `tracing` itself to inspect it.
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
+
+[target.'cfg(all(unix, not(any(target_os = "cygwin", target_os = "horizon", target_os = "openbsd", target_os = "redox", target_os = "wasi"))))'.dependencies]
+# WHY: process supplies waitid/process-group signaling, event supplies poll,
+# and fs supplies safe fcntl nonblocking setup. Unsupported waitid targets do
+# not acquire rustix and return a typed capability error before spawn.
+rustix = { version = "1.1", default-features = false, features = [
+    "event",
+    "fs",
+    "process",
+    "std",
+] }
+# WHY: captures and restores an exact caller signal mask in Epitelesis's
+# child-side spawn hook, so consumers never need an unsafe post-fork callback.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [lints]
 workspace = true
