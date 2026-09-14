@@ -268,26 +268,8 @@ mod unix {
         started: Instant,
         request: &Receiver<SupervisorRequest>,
     ) -> Result<ManagedOutput> {
-        let mut observations = Observations::default();
-        let mut forwarded_signal = None;
-        loop {
-            observe_leader(&owned, &mut observations);
-            receive_managed_request(request, &owned, &mut observations, &mut forwarded_signal);
-            observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
-            if settlement_triggered(&observations, false, false) || forwarded_signal.is_some() {
-                break;
-            }
-            let wait = wait_quantum(deadline, None);
-            match request.recv_timeout(wait) {
-                Ok(SupervisorRequest::Cancel) | Err(RecvTimeoutError::Disconnected) => {
-                    observations.cancelled = true;
-                }
-                Ok(SupervisorRequest::Forward(signal)) => {
-                    forward_managed_signal(&owned, signal, &mut forwarded_signal);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-        }
+        let (mut observations, mut forwarded_signal) =
+            await_managed_settlement(&owned, deadline, request);
 
         let cleanup_deadline = cleanup_deadline();
         let forwarded_grace_deadline = forwarded_signal.as_ref().map(|_| {
@@ -357,19 +339,13 @@ mod unix {
             let wait = cleanup_deadline
                 .saturating_duration_since(Instant::now())
                 .min(EVENT_QUANTUM);
-            match request.recv_timeout(wait) {
-                Ok(SupervisorRequest::Cancel) => observations.cancelled = true,
-                Err(RecvTimeoutError::Disconnected) => {
-                    observations.cancelled = true;
-                    // A dropped handle closes the channel immediately. Keep
-                    // bounded cleanup from spinning while descendants exit.
-                    thread::park_timeout(wait);
-                }
-                Ok(SupervisorRequest::Forward(signal)) => {
-                    forward_managed_signal(&owned, signal, &mut forwarded_signal);
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-            }
+            wait_for_managed_request(
+                request,
+                &owned,
+                &mut observations,
+                &mut forwarded_signal,
+                wait,
+            );
         }
 
         let leader_unsettled = owned.has_child();
@@ -404,6 +380,52 @@ mod unix {
             cleanup,
         });
         classify_managed(primary, program, execution.duration(), evidence)
+    }
+
+    fn await_managed_settlement(
+        owned: &OwnedChild,
+        deadline: Option<Instant>,
+        request: &Receiver<SupervisorRequest>,
+    ) -> (Observations, Option<ForwardedSignalEvidence>) {
+        let mut observations = Observations::default();
+        let mut forwarded_signal = None;
+        loop {
+            observe_leader(owned, &mut observations);
+            receive_managed_request(request, owned, &mut observations, &mut forwarded_signal);
+            observations.deadline_elapsed = deadline.is_some_and(|value| Instant::now() >= value);
+            if settlement_triggered(&observations, false, false) || forwarded_signal.is_some() {
+                return (observations, forwarded_signal);
+            }
+            wait_for_managed_request(
+                request,
+                owned,
+                &mut observations,
+                &mut forwarded_signal,
+                wait_quantum(deadline, None),
+            );
+        }
+    }
+
+    fn wait_for_managed_request(
+        request: &Receiver<SupervisorRequest>,
+        owned: &OwnedChild,
+        observations: &mut Observations,
+        forwarded_signal: &mut Option<ForwardedSignalEvidence>,
+        wait: Duration,
+    ) {
+        match request.recv_timeout(wait) {
+            Ok(SupervisorRequest::Cancel) => observations.cancelled = true,
+            Err(RecvTimeoutError::Disconnected) => {
+                observations.cancelled = true;
+                // A dropped handle closes the channel immediately. Avoid
+                // spinning while the same bounded cleanup waits for exit.
+                thread::park_timeout(wait);
+            }
+            Ok(SupervisorRequest::Forward(signal)) => {
+                forward_managed_signal(owned, signal, forwarded_signal);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
     }
 
     fn receive_managed_request(

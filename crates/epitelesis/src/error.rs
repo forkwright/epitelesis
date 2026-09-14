@@ -240,5 +240,31 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Borrow the aggregate execution evidence when a supervisor ran.
+    ///
+    /// Policy and startup refusals have no lifecycle evidence. Callers retain
+    /// ownership of rendering and redaction; this accessor never interprets
+    /// captured bytes or changes the failure's meaning.
+    #[must_use]
+    pub fn evidence(&self) -> Option<&LifecycleEvidence> {
+        match self {
+            Self::NonZeroExit { evidence, .. }
+            | Self::Timeout { evidence, .. }
+            | Self::CaptureLimitExceeded { evidence, .. }
+            | Self::Cancelled { evidence, .. }
+            | Self::CaptureFailed { evidence, .. }
+            | Self::SupervisionFailed { evidence, .. }
+            | Self::LifecycleFailed { evidence, .. }
+            | Self::CleanupIncomplete { evidence, .. } => Some(evidence),
+            Self::InvalidPolicy { .. }
+            | Self::UnsupportedCapability { .. }
+            | Self::SpawnFailed { .. }
+            | Self::SupervisorStartFailed { .. }
+            | Self::ReaperStartFailed { .. } => None,
+        }
+    }
+}
+
 /// Convenience result alias.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

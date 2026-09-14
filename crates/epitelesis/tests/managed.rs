@@ -336,3 +336,25 @@ fn wait_until_gone(pid: u32) {
         std::thread::yield_now();
     }
 }
+
+#[test]
+fn typed_error_exposes_execution_evidence_without_treating_refusal_as_execution() {
+    let refused = Command::new("/bin/true")
+        .deadline(Duration::ZERO)
+        .expect_err("a zero deadline is refused before spawn");
+    assert!(refused.evidence().is_none());
+    let failed = Command::new("/bin/sh")
+        .args(["-c", "printf diagnostic >&2; exit 7"])
+        .deadline(Duration::from_secs(5))
+        .must("valid deadline")
+        .output()
+        .expect_err("command exit remains an error");
+    let evidence = failed
+        .evidence()
+        .must("execution retains aggregate evidence");
+    assert_eq!(
+        evidence.leader_status.and_then(|status| status.code()),
+        Some(7)
+    );
+    assert_eq!(evidence.stderr.captured.bytes, b"diagnostic");
+}
