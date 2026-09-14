@@ -135,14 +135,12 @@ mod unix {
     use super::{CLEANUP_BUDGET, Cancellation, ManagedLaunch, SupervisorRequest};
     use crate::command::PreparedCommand;
     use crate::error::{
-        CancelledSnafu, CaptureFailedSnafu, CaptureLimitExceededSnafu, CleanupIncompleteEvidence,
-        CleanupIncompleteSnafu, FailureEvidence, LifecycleFailedSnafu, NonZeroExitSnafu, Result,
-        SpawnFailedSnafu, SupervisionFailedSnafu, SupervisorStartFailedSnafu, TimeoutSnafu,
+        CleanupIncompleteEvidence, FailureEvidence, Result, SpawnFailedSnafu,
+        SupervisionFailedSnafu, SupervisorStartFailedSnafu,
     };
     use crate::output::{
-        CaptureReport, CapturedStream, CleanupOutcome, ForwardedSignalEvidence, GroupSignalOutcome,
-        LeaderReapDisposition, LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output,
-        StreamName,
+        CleanupOutcome, ForwardedSignalEvidence, GroupSignalOutcome, LeaderReapDisposition,
+        LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output, StreamName,
     };
     use crate::policy::ExecutionPolicy;
 

@@ -1,6 +1,19 @@
 //! Terminal evidence classification for the Unix supervisor.
 
-use super::*;
+use std::process::ExitStatus;
+use std::time::Duration;
+
+use snafu::IntoError as _;
+
+use crate::error::{
+    CancelledSnafu, CaptureFailedSnafu, CaptureLimitExceededSnafu, CleanupIncompleteSnafu,
+    FailureEvidence, LifecycleFailedSnafu, NonZeroExitSnafu, Result, SupervisionFailedSnafu,
+    TimeoutSnafu,
+};
+use crate::output::{
+    CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,
+    LeaderReapOutcome, LifecycleEvidence, ManagedOutput, Output, StreamName,
+};
 
 #[derive(Default)]
 pub(super) struct Observations {

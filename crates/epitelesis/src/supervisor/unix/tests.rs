@@ -5,6 +5,7 @@ use std::io::Read;
 use super::evidence::Primary;
 use super::*;
 use crate::error::CaptureFailure;
+use crate::output::{CaptureReport, CapturedStream};
 use crate::policy::CapturePolicy;
 
 #[test]
