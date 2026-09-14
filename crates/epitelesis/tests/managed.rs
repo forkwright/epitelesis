@@ -341,14 +341,16 @@ fn wait_until_gone(pid: u32) {
 fn typed_error_exposes_execution_evidence_without_treating_refusal_as_execution() {
     let refused = Command::new("/bin/true")
         .deadline(Duration::ZERO)
-        .expect_err("a zero deadline is refused before spawn");
+        .err()
+        .must("a zero deadline is refused before spawn");
     assert!(refused.evidence().is_none());
     let failed = Command::new("/bin/sh")
         .args(["-c", "printf diagnostic >&2; exit 7"])
         .deadline(Duration::from_secs(5))
         .must("valid deadline")
         .output()
-        .expect_err("command exit remains an error");
+        .err()
+        .must("command exit remains an error");
     let evidence = failed
         .evidence()
         .must("execution retains aggregate evidence");
