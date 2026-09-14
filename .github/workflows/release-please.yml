@@ -19,9 +19,6 @@ permissions:
 
 jobs:
   call:
-    # WHY @main, not a pinned SHA: forkwright/.github publishes no tags, so a
-    # SHA pin here has no dependabot bump path and just freezes -- this file
-    # had sat 5 weeks behind main. forkwright/.github is first-party -- same
-    # org, same trust boundary -- not the third-party supply-chain case a SHA
-    # pin defends against.
-    uses: forkwright/.github/.github/workflows/release-please.yml@main
+    # WHY: an immutable reviewed revision binds the provider operation to
+    # its source; repository ownership alone does not freeze a mutable ref.
+    uses: forkwright/.github/.github/workflows/release-please.yml@4569711aee0fd6854f6a07278888cb94094d53bc

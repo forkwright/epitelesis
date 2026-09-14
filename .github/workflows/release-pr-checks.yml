@@ -4,10 +4,7 @@
 # -- aletheia carried the only implementation for months while 17 repos silently had
 # none, and nothing inside those repos could reveal the gap.
 #
-# WHY @main and not a SHA: forkwright/.github publishes no tags, so dependabot cannot
-# bump a SHA pin against it. The pin does not hold a reviewed version -- it freezes,
-# silently, while the reusable moves on. A first-party repo in the same trust boundary
-# is not the third-party supply-chain case a SHA pin defends against.
+# WHY: pin the reviewed provider workflow revision so changes are explicit.
 name: Release PR checks
 
 on:
@@ -44,4 +41,4 @@ permissions:
 
 jobs:
   heal:
-    uses: forkwright/.github/.github/workflows/release-pr-checks.yml@main
+    uses: forkwright/.github/.github/workflows/release-pr-checks.yml@4569711aee0fd6854f6a07278888cb94094d53bc
