@@ -1,8 +1,8 @@
 //! Thin Tokio adapter over the shared blocking supervisor.
 
-use crate::Command;
 use snafu::IntoError as _;
 
+use crate::Command;
 use crate::error::{Result, SupervisionFailedSnafu};
 use crate::output::{
     CaptureReport, CapturedStream, CleanupOutcome, GroupSignalOutcome, LeaderReapDisposition,

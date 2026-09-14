@@ -67,6 +67,7 @@ pub struct LeaderReapOutcome {
 
 /// Identifies one standard output stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum StreamName {
     /// Standard output.
     Stdout,

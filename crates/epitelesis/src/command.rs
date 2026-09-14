@@ -562,7 +562,9 @@ fn validate_path_policy<State>(command: &Command<State>) -> Result<()> {
         match operation {
             EnvOp::Set(key, _) if key == path_key => path_available = true,
             EnvOp::Remove(key) if key == path_key => path_available = false,
-            _ => {}
+            _ => {
+                // Other environment operations cannot affect PATH availability.
+            }
         }
     }
     if path_available {

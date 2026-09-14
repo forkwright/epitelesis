@@ -31,7 +31,7 @@ cmd = "kanon lint . --summary"
 timeout_secs = 300
 
 [stages."cargo doctests"]
-cmd = "cargo test --workspace --all-features --doc --locked --jobs 8"
+cmd = "cargo test --workspace --all-features --doc --locked --jobs 8 -- --test-threads 8"
 timeout_secs = 600
 
 [stages."release policy tests"]

@@ -1,6 +1,6 @@
 # epitelesis
 
-*ἐπιτέλεσις — the process of executing-to-completion.*
+*ἐπιτέλεσις - the process of executing-to-completion.*
 
 Epitelesis is a typed subprocess lifecycle boundary. It makes execution policy
 explicit before a command can run and returns structured evidence after the
@@ -17,12 +17,12 @@ the same line.
 epitelesis = { git = "https://github.com/forkwright/epitelesis", tag = "v0.4.1" } # x-release-please-version
 ```
 
-The remaining sections define the fixed breaking contract for v1. They do not
-claim that the currently tagged release already exposes that surface.
+The sections below describe the fixed v1 breaking contract. They do not claim
+that the tagged release exposes that surface.
 
 ## Invocation contract (v1)
 
-`Command` uses typestate: an invocation is not runnable until the caller picks
+`Command` uses typestate. An invocation becomes runnable when the caller picks
 one deadline policy:
 
 - a bounded deadline; or

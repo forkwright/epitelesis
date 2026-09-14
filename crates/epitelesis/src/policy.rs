@@ -73,6 +73,7 @@ impl fmt::Debug for NonEmptyReason {
 
 /// The wall-clock ownership policy for one invocation.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ExecutionPolicy {
     /// Stop and clean up the owned process group when the duration elapses.
     Deadline(Duration),
@@ -106,6 +107,7 @@ impl ExecutionPolicy {
 
 /// Which portion of the parent environment is visible before explicit ops.
 #[derive(Clone, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EnvironmentPolicy {
     /// Begin with an empty environment.
     #[default]
@@ -163,6 +165,7 @@ impl fmt::Debug for EnvironmentPolicy {
 
 /// Action taken after a stream reaches its declared byte limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum OverflowBehavior {
     /// Terminate the invocation and return a typed limit error.
     FailClosed,
@@ -172,6 +175,7 @@ pub enum OverflowBehavior {
 
 /// Capture policy for one output stream.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CapturePolicy {
     /// Retain at most `limit` bytes and apply `overflow` to further bytes.
     Bounded {
