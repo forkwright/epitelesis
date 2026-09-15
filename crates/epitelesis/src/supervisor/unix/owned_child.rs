@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn proc_stat_read_after_reap_proves_departure() {
-        let prepared = crate::command::prepare(
+        let mut prepared = crate::command::prepare(
             crate::Command::new("/bin/sh")
                 .args(["-c", "read -r _"])
                 .stdin(Stdio::piped())
