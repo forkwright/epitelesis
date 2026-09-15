@@ -227,47 +227,44 @@ mod tests {
     use super::{OwnedChild, proc_stat_read_proves_departure, start_background_reaper};
 
     #[test]
-    fn proc_stat_read_after_reap_proves_departure() {
+    fn proc_stat_read_after_reap_proves_departure() -> Result<(), Box<dyn std::error::Error>> {
         let mut prepared = crate::command::prepare(
             crate::Command::new("/bin/sh")
                 .args(["-c", "read -r _"])
                 .stdin(Stdio::piped())
-                .deadline(Duration::from_secs(1))
-                .expect("fixture deadline is valid"),
-        )
-        .expect("fixture command prepares");
-        let reaper = start_background_reaper(&prepared.program).expect("fixture reaper starts");
-        let mut child = OwnedChild::new(
-            prepared.command.spawn().expect("fixture shell starts"),
-            reaper,
-        );
-        let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))
-            .expect("fixture child stat opens before exit");
+                .deadline(Duration::from_secs(1))?,
+        )?;
+        let reaper = start_background_reaper(&prepared.program)?;
+        let mut child = OwnedChild::new(prepared.command.spawn()?, reaper);
+        let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))?;
         child
             .child_mut()
-            .expect("fixture child remains owned")
+            .ok_or("fixture child must remain owned")?
             .stdin
             .take()
-            .expect("fixture shell stdin is piped")
-            .write_all(b"\n")
-            .expect("fixture shell receives exit input");
-        child.reap_waitable().expect("fixture shell reaps");
+            .ok_or("fixture shell stdin must be piped")?
+            .write_all(b"\n")?;
+        child.reap_waitable()?;
 
         let mut contents = String::new();
         let source = stat
             .read_to_string(&mut contents)
-            .expect_err("held stat descriptor reports a departed process");
+            .err()
+            .ok_or("held stat descriptor unexpectedly read a departed process")?;
         assert_eq!(
             source.raw_os_error(),
             Some(rustix::io::Errno::SRCH.raw_os_error())
         );
         assert!(proc_stat_read_proves_departure(&source));
+        Ok(())
     }
 
     #[test]
-    fn proc_stat_missing_path_proves_departure_but_other_errors_do_not() {
+    fn proc_stat_missing_path_proves_departure_but_other_errors_do_not()
+    -> Result<(), Box<dyn std::error::Error>> {
         let source = std::fs::File::open("/proc/epitelesis-missing-process/stat")
-            .expect_err("fixture proc path is absent");
+            .err()
+            .ok_or("missing fixture proc path unexpectedly opened")?;
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
         assert!(proc_stat_read_proves_departure(&source));
 
@@ -275,6 +272,7 @@ mod tests {
             let source = std::io::Error::from_raw_os_error(errno.raw_os_error());
             assert!(!proc_stat_read_proves_departure(&source));
         }
+        Ok(())
     }
 }
 
