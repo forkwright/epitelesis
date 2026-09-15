@@ -8,7 +8,7 @@
 # provenance and security-report publication; it does not execute this gate.
 
 [pipeline]
-stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest", "cargo doctests", "release policy tests", "cargo deny", "cargo audit", "kanon lint"]
+stages = ["cargo fmt", "cargo check", "cargo clippy", "cargo nextest", "cargo doctests", "release policy tests", "cargo-deny", "cargo-audit", "osv scanner", "trufflehog", "kanon lint"]
 
 [stages."cargo fmt"]
 cmd = "cargo fmt --all -- --check"
@@ -38,15 +38,7 @@ timeout_secs = 600
 cmd = "python3 -m unittest discover -s scripts/tests -v"
 timeout_secs = 300
 
-[stages."cargo deny"]
-cmd = "cargo deny --all-features check advisories licenses bans sources"
-timeout_secs = 900
-
-[stages."cargo audit"]
-cmd = "cargo audit --deny unmaintained --deny unsound --deny yanked"
-timeout_secs = 900
-
 [schedule.security]
 cron = "0 23 11 * * * *"
 ref = "refs/heads/main"
-pipeline = ["cargo deny", "cargo audit"]
+pipeline = ["cargo-deny", "cargo-audit", "osv scanner", "trufflehog"]
