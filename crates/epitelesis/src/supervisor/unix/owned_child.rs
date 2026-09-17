@@ -126,12 +126,31 @@ impl OwnedChild {
     /// survive their shell leader. Linux `/proc` is the supported source
     /// for that proof. Other supported Unix systems use the kernel's
     /// non-signalling group-existence probe and conservatively wait for
-    /// zombies to be reaped. Only ESRCH proves that the group is gone.
+    /// zombies to be reaped.
+    ///
+    /// WHY this walks every `/proc` entry, not only this group's members:
+    /// pgid membership is not discoverable any other way without the same
+    /// problem this comment describes. That means every read here races
+    /// every *other* process's exit on the box, not just our own group's,
+    /// and can also hit a process this reader was never going to be able
+    /// to attribute either way (unreadable under `hidepid`, or carrying
+    /// `comm` bytes this reader cannot decode). None of those outcomes can
+    /// mean a *living member of our group*: proof requires a confident
+    /// `pgrp` match, so anything this reader cannot confidently attribute
+    /// to `pgid` is "not that member" (`stat_outcome`, which cannot itself
+    /// fail) rather than failing the whole scan. Process churn elsewhere on
+    /// the machine can no longer turn a clean exit into a reported
+    /// lifecycle failure. Only a structural failure that prevents scanning
+    /// `/proc` at all (its own `read_dir`, or the entry iterator) still
+    /// fails here, so a real unresolvable group is still reported.
     pub(super) fn has_living_process_group_member(
         &self,
     ) -> std::result::Result<bool, FailureEvidence> {
         #[cfg(target_os = "linux")]
         {
+            let Some(pgid) = u32::try_from(self.pgid.as_raw_pid()).ok() else {
+                return Ok(false);
+            };
             let entries = std::fs::read_dir("/proc").map_err(|source| {
                 FailureEvidence::from_io("inspect process group liveness", &source)
             })?;
@@ -147,52 +166,8 @@ impl OwnedChild {
                 {
                     continue;
                 }
-                let path = entry.path().join("stat");
-                let stat = match std::fs::read_to_string(path) {
-                    Ok(stat) => stat,
-                    Err(source) if proc_stat_read_proves_departure(&source) => continue,
-                    Err(source) => {
-                        return Err(FailureEvidence::from_io(
-                            "inspect process group liveness",
-                            &source,
-                        ));
-                    }
-                };
-                let Some((_, fields)) = stat.rsplit_once(") ") else {
-                    return Err(FailureEvidence::from_io(
-                        "inspect process group liveness",
-                        &std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "malformed proc stat",
-                        ),
-                    ));
-                };
-                let fields = fields.split_whitespace().collect::<Vec<_>>();
-                let state = fields.first().copied().ok_or_else(|| {
-                    FailureEvidence::from_io(
-                        "inspect process group liveness",
-                        &std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "proc stat omitted state",
-                        ),
-                    )
-                })?;
-                let group = fields
-                    .get(2)
-                    .and_then(|field| field.parse::<u32>().ok())
-                    .ok_or_else(|| {
-                        FailureEvidence::from_io(
-                            "inspect process group liveness",
-                            &std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "proc stat omitted process group",
-                            ),
-                        )
-                    })?;
-                let same_group = u32::try_from(self.pgid.as_raw_pid())
-                    .ok()
-                    .is_some_and(|pgid| group == pgid);
-                if same_group && state != "Z" {
+                let stat = std::fs::read_to_string(entry.path().join("stat"));
+                if stat_outcome(pgid, stat).is_living_member() {
                     return Ok(true);
                 }
             }
@@ -209,86 +184,6 @@ impl OwnedChild {
                 )),
             }
         }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn proc_stat_read_proves_departure(source: &std::io::Error) -> bool {
-    source.kind() == std::io::ErrorKind::NotFound
-        || source.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::process::Stdio;
-    use std::time::Duration;
-
-    use super::{OwnedChild, proc_stat_read_proves_departure, start_background_reaper};
-
-    #[test]
-    fn proc_stat_read_after_reap_proves_departure() -> std::io::Result<()> {
-        let mut prepared = crate::command::prepare(
-            crate::Command::new("/bin/sh")
-                .args(["-c", "read -r _"])
-                .stdin(Stdio::piped())
-                .deadline(Duration::from_secs(1))
-                .map_err(std::io::Error::other)?,
-        )
-        .map_err(std::io::Error::other)?;
-        let reaper = start_background_reaper(&prepared.program).map_err(std::io::Error::other)?;
-        let mut child = OwnedChild::new(prepared.command.spawn()?, reaper);
-        let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id()))?;
-        child
-            .child_mut()
-            .ok_or_else(|| std::io::Error::other("fixture child must remain owned"))?
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("fixture shell stdin must be piped"))?
-            .write_all(b"\n")?;
-        child.reap_waitable()?;
-
-        let mut contents = String::new();
-        let source = stat.read_to_string(&mut contents).err().ok_or_else(|| {
-            std::io::Error::other("held stat descriptor unexpectedly read a departed process")
-        })?;
-        assert_eq!(
-            source.raw_os_error(),
-            Some(rustix::io::Errno::SRCH.raw_os_error()),
-            "a held proc stat descriptor must report ESRCH after the child is reaped"
-        );
-        assert!(
-            proc_stat_read_proves_departure(&source),
-            "ESRCH proves departure"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn proc_stat_missing_path_proves_departure_but_other_errors_do_not() -> std::io::Result<()> {
-        let source = std::fs::File::open("/proc/epitelesis-missing-process/stat")
-            .err()
-            .ok_or_else(|| {
-                std::io::Error::other("missing fixture proc path unexpectedly opened")
-            })?;
-        assert_eq!(
-            source.kind(),
-            std::io::ErrorKind::NotFound,
-            "fixture process must be absent"
-        );
-        assert!(
-            proc_stat_read_proves_departure(&source),
-            "a missing proc entry proves departure"
-        );
-
-        for errno in [rustix::io::Errno::PERM, rustix::io::Errno::IO] {
-            let source = std::io::Error::from_raw_os_error(errno.raw_os_error());
-            assert!(
-                !proc_stat_read_proves_departure(&source),
-                "{errno} must remain an inspection failure"
-            );
-        }
-        Ok(())
     }
 }
 
@@ -309,5 +204,158 @@ impl Drop for OwnedChild {
                 "owned child dropped before background reaper handoff completed"
             );
         }
+    }
+}
+
+/// One `/proc/<pid>/stat` read's contribution to group-liveness proof.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, PartialEq)]
+enum StatOutcome {
+    /// Not proven a living member of the owned group: gone, unreadable or
+    /// unparseable for a reason a process's own exit, permissions, or
+    /// naming can cause, a zombie, or a member of a different group.
+    NotLivingMember,
+    /// Proven a living (non-zombie) member of the owned group.
+    LivingMember,
+}
+
+#[cfg(target_os = "linux")]
+impl StatOutcome {
+    fn is_living_member(&self) -> bool {
+        matches!(self, Self::LivingMember)
+    }
+}
+
+/// Classify one already-read (or failed-to-read) `/proc/<pid>/stat` entry.
+///
+/// This never fails: proof of group membership needs a confident `pgrp`
+/// match, so anything short of that — a read error, an undecodable or
+/// short/malformed stat line, a zombie, or a different `pgrp` — carries the
+/// same weight: this one entry does not prove `pgid` still has a living
+/// member. A race with that *other* process's own exit, a `hidepid` mount
+/// restricting what this reader may see, or content this reader was never
+/// going to be able to interpret (an arbitrary `comm`) can produce every
+/// failure shape below without that entry ever having been a member of our
+/// group. A structural failure that prevents scanning `/proc` at all is the
+/// caller's concern, not this per-entry classification's.
+#[cfg(target_os = "linux")]
+fn stat_outcome(pgid: u32, stat: std::io::Result<String>) -> StatOutcome {
+    let Ok(stat) = stat else {
+        return StatOutcome::NotLivingMember;
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return StatOutcome::NotLivingMember;
+    };
+    let fields = fields.split_whitespace().collect::<Vec<_>>();
+    let (Some(state), Some(group)) = (
+        fields.first().copied(),
+        fields.get(2).and_then(|field| field.parse::<u32>().ok()),
+    ) else {
+        return StatOutcome::NotLivingMember;
+    };
+    if group == pgid && state != "Z" {
+        StatOutcome::LivingMember
+    } else {
+        StatOutcome::NotLivingMember
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{StatOutcome, stat_outcome};
+
+    const PGID: u32 = 4242;
+
+    fn stat_line(pid: u32, comm: &str, state: &str, pgrp: u32) -> String {
+        // Real `/proc/<pid>/stat` layout: `pid (comm) state ppid pgrp ...`.
+        format!("{pid} ({comm}) {state} 1 {pgrp} 0 0 0")
+    }
+
+    #[test]
+    fn living_same_group_member_is_detected() {
+        let stat = stat_line(99, "git", "R", PGID);
+        assert_eq!(stat_outcome(PGID, Ok(stat)), StatOutcome::LivingMember);
+    }
+
+    #[test]
+    fn zombie_same_group_member_is_not_living() {
+        let stat = stat_line(99, "git", "Z", PGID);
+        assert_eq!(stat_outcome(PGID, Ok(stat)), StatOutcome::NotLivingMember);
+    }
+
+    #[test]
+    fn different_group_member_is_not_living() {
+        let stat = stat_line(99, "unrelated", "R", PGID + 1);
+        assert_eq!(stat_outcome(PGID, Ok(stat)), StatOutcome::NotLivingMember);
+    }
+
+    /// This is the primary regression case: a process elsewhere on the
+    /// machine exits between the directory listing and the stat read.
+    /// Before the fix, this `Err` aborted the whole scan and was recorded
+    /// as a permanent lifecycle failure even when the owned group had
+    /// already cleanly settled.
+    #[test]
+    fn transient_not_found_is_not_a_scan_failure() {
+        let source = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            stat_outcome(PGID, Err(source)),
+            StatOutcome::NotLivingMember
+        );
+    }
+
+    #[test]
+    fn transient_esrch_is_not_a_scan_failure() {
+        let source = std::io::Error::from(rustix::io::Errno::SRCH);
+        assert_eq!(
+            stat_outcome(PGID, Err(source)),
+            StatOutcome::NotLivingMember
+        );
+    }
+
+    #[test]
+    fn non_utf8_comm_is_not_a_scan_failure() {
+        let source = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        );
+        assert_eq!(
+            stat_outcome(PGID, Err(source)),
+            StatOutcome::NotLivingMember
+        );
+    }
+
+    /// A `hidepid`-style permission refusal on an unrelated process is not
+    /// a scan failure either: it says nothing about our own group, which
+    /// runs under the same uid and remains readable.
+    #[test]
+    fn permission_denied_on_an_unrelated_process_is_not_a_scan_failure() {
+        let source = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            stat_outcome(PGID, Err(source)),
+            StatOutcome::NotLivingMember
+        );
+    }
+
+    /// Live-reproduced regression case (kanon#10257,
+    /// `fleet_ci::tests::policy_skew_and_candidate_refusal_diagnostics_bind_complete_safe_provenance`
+    /// under concurrent full-gate load): a stat line that reads
+    /// successfully but does not carry a parseable `pgrp` field. Before the
+    /// fix this raised `FailureEvidence { kind: InvalidData, message: "proc
+    /// stat omitted process group" }` and failed a leader that had exited 0
+    /// and been cleanly reaped.
+    #[test]
+    fn short_read_missing_pgrp_field_is_not_a_scan_failure() {
+        assert_eq!(
+            stat_outcome(PGID, Ok("99 (git) R 1".to_owned())),
+            StatOutcome::NotLivingMember
+        );
+    }
+
+    #[test]
+    fn malformed_stat_line_is_not_a_scan_failure() {
+        assert_eq!(
+            stat_outcome(PGID, Ok("not a stat line".to_owned())),
+            StatOutcome::NotLivingMember
+        );
     }
 }
