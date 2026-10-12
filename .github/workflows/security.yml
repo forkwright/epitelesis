@@ -52,7 +52,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Install pinned cargo-audit
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
         with:
           tool: cargo-audit@0.22.2
       - name: cargo audit
@@ -60,7 +60,7 @@ jobs:
 
   osv-scanner:
     name: osv scanner
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc
     permissions:
       actions: read
       contents: read
